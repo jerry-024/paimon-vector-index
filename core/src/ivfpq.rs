@@ -40,6 +40,9 @@ const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
 const APPROX_ASSIGN_MEMORY_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 /// Match Lance's automatic cutoff for graph-based centroid assignment.
 const APPROX_ASSIGN_MIN_CENTROID_VALUES: usize = 1_000_000;
+/// Avoid building the centroid graph for short-lived writers where its startup
+/// cost cannot be amortized.
+const AUTO_APPROX_ASSIGN_MIN_ROWS: usize = 16 * 1024;
 
 pub(crate) fn use_approximate_assignment(d: usize, nlist: usize) -> bool {
     d.saturating_mul(nlist) >= APPROX_ASSIGN_MIN_CENTROID_VALUES
@@ -114,13 +117,15 @@ pub struct IVFPQIndex {
     /// Block-layout packed codes for 4-bit FastScan. One per list.
     fastscan_codes: Vec<Vec<u8>>,
     /// Build-only Vamana graph over the coarse centroids for approximate
-    /// assignment during `add`. Never serialized; built lazily on first `add`.
+    /// assignment during `add`. Never serialized; built lazily once automatic
+    /// assignment has enough rows, or on the first explicitly enabled `add`.
     /// IVF bucketing is a heuristic partition, so a near-tie neighbor bucket
     /// (dist ratio ~1.01 in benchmarks) is as good as the exact argmin;
     /// queries probe multiple buckets anyway.
     assign_graph: Option<crate::vamana::VamanaGraph>,
     pub(crate) approximate_assignment: bool,
     approximate_assignment_explicit: bool,
+    auto_assignment_rows_seen: usize,
 }
 
 impl IVFPQIndex {
@@ -160,6 +165,7 @@ impl IVFPQIndex {
             assign_graph: None,
             approximate_assignment: use_approximate_assignment(d, nlist),
             approximate_assignment_explicit: false,
+            auto_assignment_rows_seen: 0,
         }
     }
 
@@ -171,6 +177,7 @@ impl IVFPQIndex {
     pub(crate) fn set_approximate_assignment(&mut self, enabled: bool) {
         self.approximate_assignment = enabled;
         self.approximate_assignment_explicit = true;
+        self.auto_assignment_rows_seen = 0;
         if !enabled {
             self.assign_graph = None;
         }
@@ -227,11 +234,13 @@ impl IVFPQIndex {
             assign_graph: None,
             approximate_assignment: trained.approximate_assignment,
             approximate_assignment_explicit: trained.approximate_assignment_explicit,
+            auto_assignment_rows_seen: 0,
         }
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
         self.assign_graph = None;
+        self.auto_assignment_rows_seen = 0;
         let d = self.d;
 
         let train_data = if self.metric == MetricType::Cosine {
@@ -349,7 +358,12 @@ impl IVFPQIndex {
 
     fn add_batch(&mut self, data: &[f32], ids: &[i64], n: usize) -> io::Result<()> {
         if self.approximate_assignment && self.assign_graph.is_none() {
-            self.rebuild_assign_graph()?;
+            self.auto_assignment_rows_seen = self.auto_assignment_rows_seen.saturating_add(n);
+            if self.approximate_assignment_explicit
+                || self.auto_assignment_rows_seen >= AUTO_APPROX_ASSIGN_MIN_ROWS
+            {
+                self.rebuild_assign_graph()?;
+            }
         }
         let d = self.d;
 
@@ -3161,6 +3175,24 @@ mod tests {
     fn test_assign_graph_memory_budget() {
         assert!(validate_assign_graph_memory_budget(4096, 12, 15, 16, 1024 * 1024 * 1024).is_ok());
         assert!(validate_assign_graph_memory_budget(4096, 12, 15, 16, 1).is_err());
+    }
+
+    #[test]
+    fn test_auto_approximate_assignment_waits_for_enough_rows() {
+        let d = 4;
+        let n = 32;
+        let data = generate_clustered_data(n, d, 4, 17);
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let mut index = IVFPQIndex::new(d, 4, 2, MetricType::L2, false);
+        index.train(&data, n);
+        index.approximate_assignment = true;
+
+        index.add(&data[..d], &ids[..1], 1);
+        assert!(index.assign_graph.is_none());
+
+        index.auto_assignment_rows_seen = AUTO_APPROX_ASSIGN_MIN_ROWS - 1;
+        index.add(&data[d..2 * d], &ids[1..2], 1);
+        assert!(index.assign_graph.is_some());
     }
 
     #[test]
