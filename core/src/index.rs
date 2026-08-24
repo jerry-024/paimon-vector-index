@@ -4121,7 +4121,6 @@ mod tests {
             ("nlist", "4"),
             ("metric", "l2"),
             ("use-opq", "true"),
-            ("approximate-assignment", "true"),
         ]))
         .unwrap()
         {
