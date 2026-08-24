@@ -420,11 +420,6 @@ impl VectorIndexBuildPlan {
             },
             IndexType::IvfPq => {
                 let nlist = parse_nlist_options(&mut options, expected_vector_count)?;
-                // This is a build-only option applied by VectorIndexTrainer::from_options.
-                options
-                    .optional("approximate-assignment")
-                    .map(|value| parse_bool_option("approximate-assignment", &value))
-                    .transpose()?;
                 VectorIndexConfig::IvfPq {
                     dimension,
                     nlist,
@@ -1168,12 +1163,18 @@ pub struct VectorIndexTrainer {
 
 impl VectorIndexTrainer {
     pub fn from_options(options: &HashMap<String, String>) -> io::Result<Self> {
-        let approximate_assignment = options
-            .iter()
-            .find(|(key, _)| key.trim() == "approximate-assignment")
-            .map(|(_, value)| parse_bool_option("approximate-assignment", value))
+        let mut config_options = ConfigOptions::new(options)?;
+        let approximate_assignment = config_options
+            .optional("approximate-assignment")
+            .map(|value| parse_bool_option("approximate-assignment", &value))
             .transpose()?;
-        let config = VectorIndexConfig::from_options(options)?;
+        config_options.values.remove("approximate-assignment");
+        let config = VectorIndexConfig::from_options(&config_options.values)?;
+        if approximate_assignment.is_some() && config.index_type() != IndexType::IvfPq {
+            return Err(invalid_input(
+                "approximate-assignment is only valid for IVF-PQ",
+            ));
+        }
         match approximate_assignment {
             Some(enabled) => Self::new_with_approximate_assignment(config, enabled),
             None => Self::new(config),
@@ -4200,6 +4201,19 @@ mod tests {
             panic!("expected IVF-PQ writer");
         };
         assert!(!disabled.approximate_assignment);
+    }
+
+    #[test]
+    fn config_from_options_rejects_approximate_assignment() {
+        let values = options(&[
+            ("index.type", "ivf_pq"),
+            ("dimension", "768"),
+            ("nlist", "4096"),
+            ("metric", "cosine"),
+            ("approximate-assignment", "false"),
+        ]);
+        let error = VectorIndexConfig::from_options(&values).unwrap_err();
+        assert!(error.to_string().contains("unknown vector index option"));
     }
 
     #[test]
