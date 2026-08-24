@@ -1077,6 +1077,31 @@ mod tests {
     }
 
     #[test]
+    fn test_score_argmin_scalar_matches_squared_distance() {
+        let q = [0.4f32, -0.7, 0.2, 0.9, -0.3];
+        let ksub = 17;
+        let t: Vec<f32> = (0..q.len() * ksub)
+            .map(|i| ((i * 13 % 29) as f32 - 14.0) / 7.0)
+            .collect();
+        let norms: Vec<f32> = (0..ksub)
+            .map(|j| (0..q.len()).map(|k| t[k * ksub + j].powi(2)).sum())
+            .collect();
+        let distances: Vec<f32> = (0..ksub)
+            .map(|j| {
+                q.iter()
+                    .enumerate()
+                    .map(|(k, value)| (value - t[k * ksub + j]).powi(2))
+                    .sum()
+            })
+            .collect();
+        let mut scores = vec![0.0; ksub];
+        assert_eq!(
+            score_argmin(&q, &t, &norms, ksub, &mut scores),
+            argmin_code(&distances)
+        );
+    }
+
+    #[test]
     fn test_odd_4bit_chunk_count_uses_canonical_padding_nibble() {
         let d = 7;
         let m = 3;

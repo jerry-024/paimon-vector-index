@@ -1385,7 +1385,7 @@ impl VectorIndexWriter {
         match self {
             Self::IvfFlat(index) => index.add(data, ids, n),
             Self::IvfSq(index) => index.add(data, ids, n),
-            Self::IvfPq(index) => index.add(data, ids, n),
+            Self::IvfPq(index) => return index.try_add(data, ids, n),
             Self::IvfRq(index) => index.add(data, ids, n),
             Self::DiskAnn(index) => index.add(data, ids),
         }

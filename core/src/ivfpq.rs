@@ -95,6 +95,7 @@ pub struct IVFPQIndex {
     /// queries probe multiple buckets anyway.
     assign_graph: Option<crate::vamana::VamanaGraph>,
     pub(crate) approximate_assignment: bool,
+    approximate_assignment_explicit: bool,
 }
 
 impl IVFPQIndex {
@@ -133,6 +134,7 @@ impl IVFPQIndex {
             fastscan_codes: Vec::new(),
             assign_graph: None,
             approximate_assignment: use_approximate_assignment(d, nlist),
+            approximate_assignment_explicit: false,
         }
     }
 
@@ -143,6 +145,7 @@ impl IVFPQIndex {
 
     pub(crate) fn set_approximate_assignment(&mut self, enabled: bool) {
         self.approximate_assignment = enabled;
+        self.approximate_assignment_explicit = true;
     }
 
     /// Create an index with automatic nlist based on target partition size.
@@ -195,6 +198,7 @@ impl IVFPQIndex {
             fastscan_codes: Vec::new(),
             assign_graph: None,
             approximate_assignment: trained.approximate_assignment,
+            approximate_assignment_explicit: trained.approximate_assignment_explicit,
         }
     }
 
@@ -241,10 +245,10 @@ impl IVFPQIndex {
 
     /// Build the build-only centroid graph for approximate assignment.
     /// Skipped for small nlist, where an exact scan is cheap.
-    fn rebuild_assign_graph(&mut self) {
+    fn rebuild_assign_graph(&mut self) -> io::Result<()> {
         self.assign_graph = None;
         if !self.approximate_assignment {
-            return;
+            return Ok(());
         }
         let params = crate::diskann::DiskAnnBuildParams {
             max_degree: 12,
@@ -256,22 +260,34 @@ impl IVFPQIndex {
             raw_vector_encoding: crate::diskann::DiskAnnRawVectorEncoding::F32,
             build_distance: crate::diskann::DiskAnnBuildDistance::FullPrecision,
         };
-        // Graph build over nlist centroids is milliseconds; on failure fall
-        // back to the exact path silently (assign_graph stays None).
-        self.assign_graph = crate::vamana::VamanaGraph::build(
+        match crate::vamana::VamanaGraph::build(
             &self.quantizer_centroids,
             self.nlist,
             self.d,
             params,
-        )
-        .ok();
-        if self.assign_graph.is_none() {
-            self.approximate_assignment = false;
+        ) {
+            Ok(graph) => self.assign_graph = Some(graph),
+            Err(error) if self.approximate_assignment_explicit => return Err(error),
+            Err(error) => {
+                emit_log(
+                    LogLevel::Warn,
+                    &format!(
+                        "automatic IVF-PQ approximate assignment disabled after graph build failed: {error}"
+                    ),
+                );
+                self.approximate_assignment = false;
+            }
         }
+        Ok(())
     }
 
     /// Add vectors in batches (Faiss-style: batch assign → batch residual → batch encode).
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
+        self.try_add(data, ids, n)
+            .expect("explicit IVF-PQ approximate assignment graph build failed");
+    }
+
+    pub(crate) fn try_add(&mut self, data: &[f32], ids: &[i64], n: usize) -> io::Result<()> {
         const BATCH_SIZE: usize = 32768;
         let mut offset = 0;
         while offset < n {
@@ -280,14 +296,15 @@ impl IVFPQIndex {
                 &data[offset * self.d..(offset + batch_n) * self.d],
                 &ids[offset..offset + batch_n],
                 batch_n,
-            );
+            )?;
             offset += batch_n;
         }
+        Ok(())
     }
 
-    fn add_batch(&mut self, data: &[f32], ids: &[i64], n: usize) {
+    fn add_batch(&mut self, data: &[f32], ids: &[i64], n: usize) -> io::Result<()> {
         if self.approximate_assignment && self.assign_graph.is_none() {
-            self.rebuild_assign_graph();
+            self.rebuild_assign_graph()?;
         }
         let d = self.d;
 
@@ -361,6 +378,7 @@ impl IVFPQIndex {
         if !self.precomputed_table.is_empty() {
             self.precomputed_table.clear();
         }
+        Ok(())
     }
 
     /// Build fastscan block codes for 4-bit search acceleration.
@@ -3092,6 +3110,18 @@ mod tests {
                 .with_approximate_assignment(false)
                 .approximate_assignment
         );
+    }
+
+    #[test]
+    fn test_assign_graph_failure_only_disables_auto_mode() {
+        let mut auto = IVFPQIndex::new(1024, 1024, 16, MetricType::L2, false);
+        assert!(auto.rebuild_assign_graph().is_ok());
+        assert!(!auto.approximate_assignment);
+
+        let mut explicit =
+            IVFPQIndex::new(16, 1024, 4, MetricType::L2, false).with_approximate_assignment(true);
+        assert!(explicit.rebuild_assign_graph().is_err());
+        assert!(explicit.approximate_assignment);
     }
 
     /// With nlist above the threshold and explicit opt-in, the graph is built, and approximate
