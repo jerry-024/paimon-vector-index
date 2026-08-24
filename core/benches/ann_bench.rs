@@ -664,7 +664,6 @@ fn index_specs(config: &Config) -> Vec<IndexSpec> {
                 m: config.pq_m,
                 metric: MetricType::L2,
                 use_opq: false,
-                approximate_assignment: false,
             },
             searches: vec![ivf_search],
         },
