@@ -94,7 +94,7 @@ pub struct IVFPQIndex {
     /// (dist ratio ~1.01 in benchmarks) is as good as the exact argmin;
     /// queries probe multiple buckets anyway.
     assign_graph: Option<crate::vamana::VamanaGraph>,
-    approximate_assignment: bool,
+    pub(crate) approximate_assignment: bool,
 }
 
 impl IVFPQIndex {
@@ -137,8 +137,12 @@ impl IVFPQIndex {
     }
 
     pub fn with_approximate_assignment(mut self, enabled: bool) -> Self {
-        self.approximate_assignment = enabled;
+        self.set_approximate_assignment(enabled);
         self
+    }
+
+    pub(crate) fn set_approximate_assignment(&mut self, enabled: bool) {
+        self.approximate_assignment = enabled;
     }
 
     /// Create an index with automatic nlist based on target partition size.
