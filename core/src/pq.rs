@@ -429,14 +429,15 @@ impl ProductQuantizer {
             }
         }
 
+        let block_rows = encode_block_rows(n, rayon::current_num_threads());
         codes[..n * cs]
-            .par_chunks_mut(ENCODE_BLOCK_ROWS * cs)
+            .par_chunks_mut(block_rows * cs)
             .enumerate()
             .for_each_init(
                 || vec![0.0f32; ksub],
                 |scores, (block_idx, block_codes)| {
-                    let row0 = block_idx * ENCODE_BLOCK_ROWS;
-                    let rows = ENCODE_BLOCK_ROWS.min(n - row0);
+                    let row0 = block_idx * block_rows;
+                    let rows = block_rows.min(n - row0);
                     let block_data = &data[row0 * d..(row0 + rows) * d];
 
                     for r in 0..rows {
@@ -613,9 +614,14 @@ fn argmin_code(distances: &[f32]) -> u8 {
 /// Row block for the transposed batch-encode path. 512 rows keeps the
 /// per-thread score buffer at 1 KiB and yields ~20 blocks per thread at the
 /// production 32,768-row add batch.
-const ENCODE_BLOCK_ROWS: usize = 512;
+const MAX_ENCODE_BLOCK_ROWS: usize = 512;
 /// Below this row count the one-time codebook transpose is not worth it.
 const ENCODE_TRANSPOSE_MIN_ROWS: usize = 32;
+
+fn encode_block_rows(rows: usize, workers: usize) -> usize {
+    rows.div_ceil(workers.max(1))
+        .clamp(32, MAX_ENCODE_BLOCK_ROWS)
+}
 
 /// Squared-L2 argmin over a transposed sub-codebook.
 ///
@@ -982,8 +988,8 @@ mod tests {
             31,
             32,
             33,
-            ENCODE_BLOCK_ROWS,
-            ENCODE_BLOCK_ROWS + 7,
+            MAX_ENCODE_BLOCK_ROWS,
+            MAX_ENCODE_BLOCK_ROWS + 7,
             2048,
         ] {
             let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
@@ -1005,7 +1011,7 @@ mod tests {
         let mut pq = ProductQuantizer::with_nbits_balanced(d, m, 8);
         pq.train(&train, 2000);
 
-        let n = ENCODE_BLOCK_ROWS + 13;
+        let n = MAX_ENCODE_BLOCK_ROWS + 13;
         let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
         let reference = encode_per_vector(&pq, &data, n);
         let mut batch = vec![0u8; n * pq.code_size()];
@@ -1026,6 +1032,13 @@ mod tests {
         pq.encode_batch_blocked(&data, n, &mut codes);
 
         assert!(codes.iter().all(|&code| code == 1));
+    }
+
+    #[test]
+    fn test_encode_block_rows_uses_available_workers() {
+        assert_eq!(encode_block_rows(2730, 12), 228);
+        assert_eq!(encode_block_rows(32768, 12), MAX_ENCODE_BLOCK_ROWS);
+        assert_eq!(encode_block_rows(32, 64), 32);
     }
 
     #[test]

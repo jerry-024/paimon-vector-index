@@ -37,11 +37,36 @@ use std::time::{Duration, Instant};
 /// Beam width for graph-based coarse assignment. Keep this at least as wide
 /// as the graph build search to avoid poor local minima.
 const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
+const APPROX_ASSIGN_MEMORY_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 /// Match Lance's automatic cutoff for graph-based centroid assignment.
 const APPROX_ASSIGN_MIN_CENTROID_VALUES: usize = 1_000_000;
 
 pub(crate) fn use_approximate_assignment(d: usize, nlist: usize) -> bool {
     d.saturating_mul(nlist) >= APPROX_ASSIGN_MIN_CENTROID_VALUES
+}
+
+fn validate_assign_graph_memory_budget(
+    nlist: usize,
+    max_degree: usize,
+    search_list_size: usize,
+    workers: usize,
+    budget: usize,
+) -> io::Result<()> {
+    let estimated_peak =
+        crate::vamana::estimate_vamana_memory_bytes(nlist, max_degree, search_list_size, workers)
+            .map(|estimate| estimate.build_peak_bytes.max(estimate.remap_peak_bytes));
+    if estimated_peak.is_none_or(|peak| peak > budget) {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!(
+                "IVF-PQ approximate assignment graph requires {} bytes, exceeding the {budget} byte budget",
+                estimated_peak
+                    .map(|peak| peak.to_string())
+                    .unwrap_or_else(|| "an unrepresentable amount of memory".to_string())
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub trait RowIdFilter: Sync {
@@ -258,11 +283,28 @@ impl IVFPQIndex {
             build_search_list_size: APPROX_ASSIGN_SEARCH_LIST,
             alpha: 1.2,
             seed: 42,
-            memory_budget_bytes: 1024 * 1024 * 1024,
+            memory_budget_bytes: APPROX_ASSIGN_MEMORY_BUDGET_BYTES,
             storage_layout: crate::diskann::DiskAnnStorageLayout::Compact,
             raw_vector_encoding: crate::diskann::DiskAnnRawVectorEncoding::F32,
             build_distance: crate::diskann::DiskAnnBuildDistance::FullPrecision,
         };
+        if let Err(error) = validate_assign_graph_memory_budget(
+            self.nlist,
+            params.max_degree,
+            params.build_search_list_size,
+            rayon::current_num_threads(),
+            params.memory_budget_bytes,
+        ) {
+            if self.approximate_assignment_explicit {
+                return Err(error);
+            }
+            emit_log(
+                LogLevel::Warn,
+                &format!("automatic IVF-PQ approximate assignment disabled: {error}"),
+            );
+            self.approximate_assignment = false;
+            return Ok(());
+        }
         match crate::vamana::VamanaGraph::build(
             &self.quantizer_centroids,
             self.nlist,
@@ -3113,6 +3155,12 @@ mod tests {
                 .with_approximate_assignment(false)
                 .approximate_assignment
         );
+    }
+
+    #[test]
+    fn test_assign_graph_memory_budget() {
+        assert!(validate_assign_graph_memory_budget(4096, 12, 15, 16, 1024 * 1024 * 1024).is_ok());
+        assert!(validate_assign_graph_memory_budget(4096, 12, 15, 16, 1).is_err());
     }
 
     #[test]
