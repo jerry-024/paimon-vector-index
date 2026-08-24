@@ -146,6 +146,9 @@ impl IVFPQIndex {
     pub(crate) fn set_approximate_assignment(&mut self, enabled: bool) {
         self.approximate_assignment = enabled;
         self.approximate_assignment_explicit = true;
+        if !enabled {
+            self.assign_graph = None;
+        }
     }
 
     /// Create an index with automatic nlist based on target partition size.
@@ -3110,6 +3113,17 @@ mod tests {
                 .with_approximate_assignment(false)
                 .approximate_assignment
         );
+    }
+
+    #[test]
+    fn test_disabling_approximate_assignment_clears_graph() {
+        let mut index =
+            IVFPQIndex::new(16, 1024, 4, MetricType::L2, false).with_approximate_assignment(true);
+        index.assign_graph = Some(crate::vamana::VamanaGraph::from_adjacency(0, vec![vec![]]));
+
+        index.set_approximate_assignment(false);
+
+        assert!(index.assign_graph.is_none());
     }
 
     #[test]

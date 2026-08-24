@@ -411,16 +411,6 @@ impl ProductQuantizer {
         debug_assert_eq!(cs, m);
         debug_assert_eq!(ksub, 256);
 
-        // Norms cache is rebuilt after train/load; fall back to computing it
-        // for quantizers constructed by hand.
-        let norms_storage;
-        let norms: &[f32] = if self.centroid_norms_cache.is_empty() {
-            norms_storage = self.compute_centroid_norms();
-            &norms_storage
-        } else {
-            &self.centroid_norms_cache
-        };
-
         // One-time transpose: per sub, [ksub][dsub] -> [dsub][ksub] with a
         // uniform stride of max_dsub so sub lookup stays O(1).
         let max_dsub = (0..m).map(|sub| self.chunk_dim(sub)).max().unwrap_or(0);
@@ -456,8 +446,7 @@ impl ProductQuantizer {
                             let dsub = range.len();
                             let q = &row[range];
                             let t = &transposed[sub * sub_stride..sub * sub_stride + dsub * ksub];
-                            let nb = &norms[sub * ksub..(sub + 1) * ksub];
-                            block_codes[r * cs + sub] = score_argmin(q, t, nb, ksub, scores);
+                            block_codes[r * cs + sub] = score_argmin(q, t, ksub, scores);
                         }
                     }
                 },
@@ -628,18 +617,18 @@ const ENCODE_BLOCK_ROWS: usize = 512;
 /// Below this row count the one-time codebook transpose is not worth it.
 const ENCODE_TRANSPOSE_MIN_ROWS: usize = 32;
 
-/// `argmin_j (norms[j] - 2 * q · t[.., j])` over a transposed sub-codebook.
+/// Squared-L2 argmin over a transposed sub-codebook.
 ///
-/// `t` is `[dsub][ksub]` (stride-1 over `j`), `norms` holds `|c_j|^2`, and
-/// `scores` is a reusable `ksub`-sized scratch buffer. Ties resolve to the
-/// smallest index, matching `argmin_code`'s strictly-smaller update rule.
+/// `t` is `[dsub][ksub]` (stride-1 over `j`) and `scores` is a reusable
+/// `ksub`-sized scratch buffer. Ties resolve to the smallest index, matching
+/// `argmin_code`'s strictly-smaller update rule.
 #[inline]
-fn score_argmin(q: &[f32], t: &[f32], norms: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
+fn score_argmin(q: &[f32], t: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
     #[cfg(target_arch = "aarch64")]
     {
         if q.len() == 4 && ksub.is_multiple_of(4) {
             // SAFETY: NEON is baseline on aarch64; slice bounds checked by caller.
-            return unsafe { score_argmin_neon_d4(q, t, norms, ksub) };
+            return unsafe { score_argmin_neon_d4(q, t, ksub) };
         }
     }
     #[cfg(target_arch = "x86_64")]
@@ -650,24 +639,21 @@ fn score_argmin(q: &[f32], t: &[f32], norms: &[f32], ksub: usize, scores: &mut [
             && is_x86_feature_detected!("fma")
         {
             // SAFETY: AVX2 and FMA presence checked above; slice bounds checked by caller.
-            return unsafe { score_argmin_avx2_d4(q, t, norms, ksub) };
+            return unsafe { score_argmin_avx2_d4(q, t, ksub) };
         }
     }
-    score_argmin_scalar(q, t, norms, ksub, scores)
+    score_argmin_scalar(q, t, ksub, scores)
 }
 
 #[inline]
-fn score_argmin_scalar(q: &[f32], t: &[f32], norms: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
+fn score_argmin_scalar(q: &[f32], t: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
     let dsub = q.len();
-    let q0 = -2.0 * q[0];
-    for j in 0..ksub {
-        scores[j] = norms[j] + q0 * t[j];
-    }
-    for (k, &qv) in q.iter().enumerate().skip(1) {
-        let qk = -2.0 * qv;
+    scores[..ksub].fill(0.0);
+    for (k, &qv) in q.iter().enumerate() {
         let tk = &t[k * ksub..(k + 1) * ksub];
         for j in 0..ksub {
-            scores[j] += qk * tk[j];
+            let diff = qv - tk[j];
+            scores[j] = diff.mul_add(diff, scores[j]);
         }
     }
     debug_assert_eq!(dsub * ksub, t.len());
@@ -678,7 +664,7 @@ fn score_argmin_scalar(q: &[f32], t: &[f32], norms: &[f32], ksub: usize, scores:
 /// horizontal reduce with smallest-index tie-break.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn score_argmin_neon_d4(q: &[f32], t: &[f32], norms: &[f32], ksub: usize) -> u8 {
+unsafe fn score_argmin_neon_d4(q: &[f32], t: &[f32], ksub: usize) -> u8 {
     use std::arch::aarch64::*;
 
     let t0 = t.as_ptr();
@@ -687,10 +673,10 @@ unsafe fn score_argmin_neon_d4(q: &[f32], t: &[f32], norms: &[f32], ksub: usize)
     let t3 = unsafe { t0.add(3 * ksub) };
 
     unsafe {
-        let q0 = vdupq_n_f32(-2.0 * q[0]);
-        let q1 = vdupq_n_f32(-2.0 * q[1]);
-        let q2 = vdupq_n_f32(-2.0 * q[2]);
-        let q3 = vdupq_n_f32(-2.0 * q[3]);
+        let q0 = vdupq_n_f32(q[0]);
+        let q1 = vdupq_n_f32(q[1]);
+        let q2 = vdupq_n_f32(q[2]);
+        let q3 = vdupq_n_f32(q[3]);
 
         let mut min_val = vdupq_n_f32(f32::MAX);
         let mut min_idx = vdupq_n_u32(0);
@@ -699,11 +685,14 @@ unsafe fn score_argmin_neon_d4(q: &[f32], t: &[f32], norms: &[f32], ksub: usize)
         let step = vdupq_n_u32(4);
 
         for j in (0..ksub).step_by(4) {
-            let mut s = vld1q_f32(norms.as_ptr().add(j));
-            s = vfmaq_f32(s, q0, vld1q_f32(t0.add(j)));
-            s = vfmaq_f32(s, q1, vld1q_f32(t1.add(j)));
-            s = vfmaq_f32(s, q2, vld1q_f32(t2.add(j)));
-            s = vfmaq_f32(s, q3, vld1q_f32(t3.add(j)));
+            let d0 = vsubq_f32(q0, vld1q_f32(t0.add(j)));
+            let d1 = vsubq_f32(q1, vld1q_f32(t1.add(j)));
+            let d2 = vsubq_f32(q2, vld1q_f32(t2.add(j)));
+            let d3 = vsubq_f32(q3, vld1q_f32(t3.add(j)));
+            let mut s = vmulq_f32(d0, d0);
+            s = vfmaq_f32(s, d1, d1);
+            s = vfmaq_f32(s, d2, d2);
+            s = vfmaq_f32(s, d3, d3);
 
             // Strictly-smaller keeps the earliest index on equal scores.
             let mask = vcltq_f32(s, min_val);
@@ -731,7 +720,7 @@ unsafe fn score_argmin_neon_d4(q: &[f32], t: &[f32], norms: &[f32], ksub: usize)
 /// dsub=4 AVX2 kernel: mirrors the NEON version 8-wide.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn score_argmin_avx2_d4(q: &[f32], t: &[f32], norms: &[f32], ksub: usize) -> u8 {
+unsafe fn score_argmin_avx2_d4(q: &[f32], t: &[f32], ksub: usize) -> u8 {
     use std::arch::x86_64::*;
 
     let t0 = t.as_ptr();
@@ -740,10 +729,10 @@ unsafe fn score_argmin_avx2_d4(q: &[f32], t: &[f32], norms: &[f32], ksub: usize)
     let t3 = unsafe { t0.add(3 * ksub) };
 
     unsafe {
-        let q0 = _mm256_set1_ps(-2.0 * q[0]);
-        let q1 = _mm256_set1_ps(-2.0 * q[1]);
-        let q2 = _mm256_set1_ps(-2.0 * q[2]);
-        let q3 = _mm256_set1_ps(-2.0 * q[3]);
+        let q0 = _mm256_set1_ps(q[0]);
+        let q1 = _mm256_set1_ps(q[1]);
+        let q2 = _mm256_set1_ps(q[2]);
+        let q3 = _mm256_set1_ps(q[3]);
 
         let mut min_val = _mm256_set1_ps(f32::MAX);
         let mut min_idx = _mm256_setzero_si256();
@@ -751,11 +740,14 @@ unsafe fn score_argmin_avx2_d4(q: &[f32], t: &[f32], norms: &[f32], ksub: usize)
         let step = _mm256_set1_epi32(8);
 
         for j in (0..ksub).step_by(8) {
-            let mut s = _mm256_loadu_ps(norms.as_ptr().add(j));
-            s = _mm256_fmadd_ps(q0, _mm256_loadu_ps(t0.add(j)), s);
-            s = _mm256_fmadd_ps(q1, _mm256_loadu_ps(t1.add(j)), s);
-            s = _mm256_fmadd_ps(q2, _mm256_loadu_ps(t2.add(j)), s);
-            s = _mm256_fmadd_ps(q3, _mm256_loadu_ps(t3.add(j)), s);
+            let d0 = _mm256_sub_ps(q0, _mm256_loadu_ps(t0.add(j)));
+            let d1 = _mm256_sub_ps(q1, _mm256_loadu_ps(t1.add(j)));
+            let d2 = _mm256_sub_ps(q2, _mm256_loadu_ps(t2.add(j)));
+            let d3 = _mm256_sub_ps(q3, _mm256_loadu_ps(t3.add(j)));
+            let mut s = _mm256_mul_ps(d0, d0);
+            s = _mm256_fmadd_ps(d1, d1, s);
+            s = _mm256_fmadd_ps(d2, d2, s);
+            s = _mm256_fmadd_ps(d3, d3, s);
 
             // Strictly-smaller keeps the earliest index on equal scores.
             let mask = _mm256_cmp_ps::<_CMP_LT_OQ>(s, min_val);
@@ -1022,11 +1014,11 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_batch_blocked_low_dim_large_offset() {
-        let mut pq = ProductQuantizer::new(2, 1);
+    fn test_encode_batch_blocked_large_offset() {
+        let mut pq = ProductQuantizer::new(4, 1);
         pq.centroids = vec![100_000_016.0; pq.d * pq.ksub];
-        pq.centroids[0..2].fill(100_000_008.0);
-        pq.centroids[2..4].fill(100_000_000.0);
+        pq.centroids[0..4].fill(100_000_008.0);
+        pq.centroids[4..8].fill(100_000_000.0);
 
         let n = ENCODE_TRANSPOSE_MIN_ROWS;
         let data = vec![100_000_000.0; n * pq.d];
@@ -1038,8 +1030,7 @@ mod tests {
 
     #[test]
     fn test_encode_batch_without_norms_cache() {
-        // Hand-built quantizer (no train): norms cache empty, transposed
-        // path must compute norms on the fly and still match.
+        // Hand-built quantizer (no train) must work on the transposed path.
         let d = 8;
         let m = 2;
         let mut rng = StdRng::seed_from_u64(20260822);
@@ -1071,9 +1062,8 @@ mod tests {
                 t[k * ksub + j] = 0.5;
             }
         }
-        let norms = vec![dsub as f32 * 0.25; ksub];
         let mut scores = vec![0.0f32; ksub];
-        assert_eq!(score_argmin(&q, &t, &norms, ksub, &mut scores), 0);
+        assert_eq!(score_argmin(&q, &t, ksub, &mut scores), 0);
     }
 
     #[test]
@@ -1082,9 +1072,6 @@ mod tests {
         let ksub = 17;
         let t: Vec<f32> = (0..q.len() * ksub)
             .map(|i| ((i * 13 % 29) as f32 - 14.0) / 7.0)
-            .collect();
-        let norms: Vec<f32> = (0..ksub)
-            .map(|j| (0..q.len()).map(|k| t[k * ksub + j].powi(2)).sum())
             .collect();
         let distances: Vec<f32> = (0..ksub)
             .map(|j| {
@@ -1096,7 +1083,7 @@ mod tests {
             .collect();
         let mut scores = vec![0.0; ksub];
         assert_eq!(
-            score_argmin(&q, &t, &norms, ksub, &mut scores),
+            score_argmin(&q, &t, ksub, &mut scores),
             argmin_code(&distances)
         );
     }
