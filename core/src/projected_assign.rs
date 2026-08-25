@@ -38,7 +38,7 @@
 //! GEMM. `d'` is therefore chosen by cost: at `train`, candidate widths are
 //! tried on a sample of training vectors, the number of exact checks each
 //! needs is measured, and the width minimizing `d'·nlist + w·checks·d` wins;
-//! automatic mode keeps the projection only when that cost is clearly below
+//! automatic mode keeps the projection only when that cost is below
 //! the exact scan's `d·nlist`. (Without a sample the width falls back to 95%
 //! explained variance, gated by `d' ≤ d / 3`.)
 //!
@@ -69,7 +69,7 @@ const BOUND_COST: f64 = 4.0;
 const EXACT_CHECK_WEIGHT: f64 = 6.0;
 /// With a calibration sample, automatic mode keeps the projection only when
 /// its modeled cost is below this fraction of the exact scan.
-const MAX_AUTO_COST_FRACTION: f64 = 0.7;
+const MAX_AUTO_COST_FRACTION: f64 = 0.85;
 /// Block subspace iterations; the bound stays valid regardless of convergence.
 const SUBSPACE_ITERATIONS: usize = 8;
 const SUBSPACE_SEED: u64 = 0x7a5e_c7ed;
@@ -278,6 +278,13 @@ impl CoarseProjection {
         }
         let (cost, dp) = best?;
         if !force && cost > exact_cost * MAX_AUTO_COST_FRACTION {
+            crate::logging::emit_log(
+                crate::logging::LogLevel::Info,
+                &format!(
+                    "IVF-PQ projected assignment not used: best width d'={dp} models {:.0}% of the exact scan cost",
+                    cost / exact_cost * 100.0
+                ),
+            );
             return None;
         }
         Some(dp)
@@ -437,11 +444,13 @@ impl CoarseProjection {
                             candidates.push((bound, c as u32));
                         }
                     }
-                    // Evaluate in small stages while pruning is effective. If
-                    // more than two stages survive the first one, sort the
-                    // remainder once to avoid quadratic repeated partitioning.
+                    // Evaluate the `STAGE` smallest bounds first: the best
+                    // distance usually drops within a few exact checks, which
+                    // prunes most of the rest without sorting them. If it does
+                    // not, sort what survives once and finish linearly, so weak
+                    // pruning costs O(k log k) rather than one partition per
+                    // stage.
                     let mut pending = candidates.as_mut_slice();
-                    let mut first_stage = true;
                     while !pending.is_empty() {
                         let stage = STAGE.min(pending.len());
                         if stage < pending.len() {
@@ -470,7 +479,7 @@ impl CoarseProjection {
                             }
                         }
                         pending = &mut tail[..kept];
-                        if first_stage && pending.len() > 2 * STAGE {
+                        if pending.len() > STAGE * 2 {
                             pending.sort_unstable_by(compare_bound_then_index);
                             evaluations += evaluate_candidates(
                                 x_i,
@@ -483,7 +492,6 @@ impl CoarseProjection {
                             );
                             break;
                         }
-                        first_stage = false;
                     }
                     chunk[i] = best_idx;
                 }
