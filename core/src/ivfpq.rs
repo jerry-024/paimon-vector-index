@@ -233,27 +233,40 @@ impl IVFPQIndex {
         // Retrain PQ on the exact distribution that add/search will encode.
         // For OPQ: opq.train() trained PQ on centered data, but add/search
         // encode uncentered vectors, so we must retrain here for all metrics.
+        let calibration = calibration_sample(&effective_data, n, d);
         let pq_train_data = if self.by_residual {
             compute_residuals(&effective_data, n, d, &self.quantizer_centroids, self.nlist)
         } else {
             effective_data
         };
         self.pq.train(&pq_train_data, n);
-        self.rebuild_coarse_projection();
+        self.rebuild_coarse_projection_with(&calibration, calibration.len() / d.max(1));
     }
 
     /// Fit the build-only centroid projection used by `add`. Auto mode keeps
     /// it only when the centroids are compressible enough for the projected
     /// branch-and-bound to beat the exact scan; the result is exact either way.
     fn rebuild_coarse_projection(&mut self) {
+        self.rebuild_coarse_projection_with(&[], 0);
+    }
+
+    /// `calibration` (`rows × d`, centroid space) lets the projection pick its
+    /// width by measured cost; without it the variance rule applies.
+    fn rebuild_coarse_projection_with(&mut self, calibration: &[f32], rows: usize) {
         self.coarse_projection = None;
         let force = match self.projected_assignment {
             ProjectedAssignment::Disabled => return,
             ProjectedAssignment::Enabled => true,
             ProjectedAssignment::Auto => false,
         };
-        let projection =
-            CoarseProjection::train(&self.quantizer_centroids, self.nlist, self.d, force);
+        let projection = CoarseProjection::train(
+            &self.quantizer_centroids,
+            self.nlist,
+            self.d,
+            force,
+            calibration,
+            rows,
+        );
         match &projection {
             Some(p) => emit_log(
                 LogLevel::Info,
@@ -2906,6 +2919,18 @@ fn seed_heaps(heaps: &mut [TopKHeap], seed_ids: &[i64], seed_distances: &[f32], 
 
 // --- Utilities ---
 
+/// Evenly strided rows of the training data for projection calibration.
+fn calibration_sample(data: &[f32], n: usize, d: usize) -> Vec<f32> {
+    let rows = crate::projected_assign::CALIBRATION_ROWS.min(n);
+    if rows == 0 || d == 0 {
+        return Vec::new();
+    }
+    let stride = n / rows;
+    (0..rows)
+        .flat_map(|i| data[i * stride * d..(i * stride + 1) * d].iter().copied())
+        .collect()
+}
+
 fn compute_residuals(
     data: &[f32],
     n: usize,
@@ -3126,8 +3151,9 @@ mod tests {
             .expect("compressible centroids keep the projection");
         assert!(projection.dimension() * 3 <= d);
 
-        // Full-rank clusters: nothing to compress, auto falls back to the scan.
-        let unstructured = generate_clustered_data(n, d, 128, 22);
+        // Uniform noise: no width prunes enough, auto falls back to the scan.
+        let mut rng = StdRng::seed_from_u64(22);
+        let unstructured: Vec<f32> = (0..n * d).map(|_| rng.gen::<f32>()).collect();
         let mut index = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false);
         index.train(&unstructured, n);
         assert!(index.coarse_projection().is_none());

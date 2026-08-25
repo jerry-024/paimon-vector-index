@@ -32,14 +32,18 @@
 //! never depends on how well the PCA converged; `P` only decides how many
 //! exact evaluations step 3 needs. Rows without low-dimensional structure
 //! degrade to checking every centroid, i.e. the exact scan plus one small
-//! GEMM, so automatic mode only keeps a projection when the centroids are
-//! compressible enough (`d' ≤ d / 3` at 95% explained variance).
+//! GEMM. `d'` is therefore chosen by cost: at `train`, candidate widths are
+//! tried on a sample of training vectors, the number of exact checks each
+//! needs is measured, and the width minimizing `d'·nlist + w·checks·d` wins;
+//! automatic mode keeps the projection only when that cost is clearly below
+//! the exact scan's `d·nlist`. (Without a sample the width falls back to 95%
+//! explained variance, gated by `d' ≤ d / 3`.)
 //!
 //! The projection is a training artifact: it is derived deterministically from
 //! the centroids, shared by `IVFPQIndex::from_trained`, and never serialized.
 
 use crate::blas::sgemm_a_bt;
-use crate::distance::fvec_l2sqr;
+use crate::distance::{fvec_l2sqr, fvec_l2sqr_four};
 use nalgebra::{DMatrix, SymmetricEigen};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -47,8 +51,22 @@ use rayon::prelude::*;
 
 /// Fraction of centroid variance the projection must explain.
 const VARIANCE_TARGET: f64 = 0.95;
-/// Automatic mode keeps the projection only when `d' * MAX_AUTO_DP_DIVISOR <= d`.
+/// Without a calibration sample, automatic mode keeps the projection only
+/// when `d' * MAX_AUTO_DP_DIVISOR <= d`.
 const MAX_AUTO_DP_DIVISOR: usize = 3;
+/// Calibration samples below this fall back to the variance rule.
+const MIN_CALIBRATION_ROWS: usize = 256;
+/// Rows of the training data used to calibrate `d'`.
+pub(crate) const CALIBRATION_ROWS: usize = 2048;
+/// Per-centroid cost of computing one bound, in GEMM multiply-add units.
+const BOUND_COST: f64 = 4.0;
+/// Cost of one exact-check multiply-add relative to a GEMM multiply-add:
+/// exact checks gather scattered centroids row by row, with no blocking.
+/// Fitted on Cohere-768 / nlist=4096 timings across d' = 32..384.
+const EXACT_CHECK_WEIGHT: f64 = 6.0;
+/// With a calibration sample, automatic mode keeps the projection only when
+/// its modeled cost is below this fraction of the exact scan.
+const MAX_AUTO_COST_FRACTION: f64 = 0.7;
 /// Block subspace iterations; the bound stays valid regardless of convergence.
 const SUBSPACE_ITERATIONS: usize = 8;
 const SUBSPACE_SEED: u64 = 0x7a5e_c7ed;
@@ -58,6 +76,8 @@ const MIN_DP: usize = 8;
 const MAX_BLOCK_ROWS: usize = 1024;
 /// Leave a visible margin below one after rounding the projection to f32.
 const CONTRACTION_MARGIN: f64 = 0.999;
+/// Candidates evaluated per branch-and-bound stage before re-pruning.
+const STAGE: usize = 32;
 
 /// How `IVFPQIndex::add` chooses between the exact centroid scan and the
 /// projected branch-and-bound. Both produce the exact nearest centroid.
@@ -95,10 +115,26 @@ pub struct CoarseProjection {
 impl CoarseProjection {
     /// Fit a projection to `nlist` centroids of dimension `d`.
     ///
+    /// `calibration` holds `calibration_rows` sample vectors in the centroid
+    /// space (typically training vectors). When present, `d'` is chosen by
+    /// measuring, for each candidate width, how many exact distance checks
+    /// the branch-and-bound needs on that sample and picking the width that
+    /// minimizes `d' * nlist + EXACT_CHECK_WEIGHT * checks * d`; automatic mode then keeps the
+    /// projection only when that cost is clearly below the exact scan's
+    /// `d * nlist`. Without a sample, `d'` falls back to the smallest width
+    /// explaining `VARIANCE_TARGET` of the centroid variance, gated by
+    /// `MAX_AUTO_DP_DIVISOR`.
+    ///
     /// Returns `None` when the projection is not worth it (`force == false`)
-    /// or cannot be built: too few centroids, zero variance, or a `d'` that
-    /// would not shrink the GEMM by at least `MAX_AUTO_DP_DIVISOR`.
-    pub(crate) fn train(cents: &[f32], nlist: usize, d: usize, force: bool) -> Option<Self> {
+    /// or cannot be built (too few centroids, zero variance).
+    pub(crate) fn train(
+        cents: &[f32],
+        nlist: usize,
+        d: usize,
+        force: bool,
+        calibration: &[f32],
+        calibration_rows: usize,
+    ) -> Option<Self> {
         if nlist == 0 || d == 0 {
             return None;
         }
@@ -132,6 +168,40 @@ impl CoarseProjection {
         }
 
         let (basis, eigenvalues) = top_subspace(&centered, nlist, d, block);
+        let calibration_rows = calibration_rows.min(calibration.len() / d.max(1));
+        let dp = if calibration_rows >= MIN_CALIBRATION_ROWS {
+            Self::select_width_by_cost(
+                cents,
+                &basis,
+                nlist,
+                d,
+                block,
+                force,
+                &calibration[..calibration_rows * d],
+                calibration_rows,
+            )?
+        } else {
+            Self::select_width_by_variance(&eigenvalues, total_variance, block, d, force)?
+        };
+        let explained_variance = eigenvalues[..dp].iter().sum::<f64>() / total_variance;
+        Some(Self::from_basis(
+            cents,
+            &basis,
+            nlist,
+            d,
+            dp,
+            explained_variance,
+        ))
+    }
+
+    /// Smallest width explaining `VARIANCE_TARGET` of the centroid variance.
+    fn select_width_by_variance(
+        eigenvalues: &[f64],
+        total_variance: f64,
+        block: usize,
+        d: usize,
+        force: bool,
+    ) -> Option<usize> {
         let target = VARIANCE_TARGET * total_variance;
         let mut cumulative = 0.0;
         let mut dp = None;
@@ -151,10 +221,60 @@ impl CoarseProjection {
         if !force && dp * MAX_AUTO_DP_DIVISOR > d {
             return None;
         }
-        let explained_variance = eigenvalues[..dp].iter().sum::<f64>() / total_variance;
+        Some(dp)
+    }
+
+    /// Width minimizing the measured per-row cost on the calibration sample.
+    #[allow(clippy::too_many_arguments)]
+    fn select_width_by_cost(
+        cents: &[f32],
+        basis: &[f32],
+        nlist: usize,
+        d: usize,
+        block: usize,
+        force: bool,
+        calibration: &[f32],
+        calibration_rows: usize,
+    ) -> Option<usize> {
+        let exact_cost = (d * nlist) as f64;
+        let mut best: Option<(f64, usize)> = None;
+        let mut widths: Vec<usize> = [8usize, 4, 2]
+            .iter()
+            .map(|div| (block / div).div_ceil(MIN_DP) * MIN_DP)
+            .chain([(block * 3 / 4).div_ceil(MIN_DP) * MIN_DP, block])
+            .filter(|&w| w >= MIN_DP && w <= block)
+            .collect();
+        widths.sort_unstable();
+        widths.dedup();
+        for dp in widths {
+            let candidate = Self::from_basis(cents, basis, nlist, d, dp, 0.0);
+            let (_, evaluations) =
+                candidate.assign_with_stats(calibration, calibration_rows, cents, nlist);
+            let checks_per_row = evaluations as f64 / calibration_rows as f64;
+            let cost = (dp * nlist) as f64
+                + EXACT_CHECK_WEIGHT * checks_per_row * d as f64
+                + BOUND_COST * nlist as f64;
+            if best.is_none_or(|(c, _)| cost < c) {
+                best = Some((cost, dp));
+            }
+        }
+        let (cost, dp) = best?;
+        if !force && cost > exact_cost * MAX_AUTO_COST_FRACTION {
+            return None;
+        }
+        Some(dp)
+    }
+
+    fn from_basis(
+        cents: &[f32],
+        basis: &[f32],
+        nlist: usize,
+        d: usize,
+        dp: usize,
+        explained_variance: f64,
+    ) -> Self {
         let mut proj = basis[..dp * d].to_vec();
         make_contractive(&mut proj, dp, d);
-
         let mut cents_p = vec![0.0f32; nlist * dp];
         // Project uncentered vectors. Translation cancels in x-c, while this
         // avoids a second source of f32 rounding in the lower bound.
@@ -167,7 +287,7 @@ impl CoarseProjection {
             .chunks_exact(d)
             .map(|c| projection_error(norm_upper(c), d, dp))
             .collect();
-        Some(Self {
+        Self {
             d,
             dp,
             explained_variance,
@@ -176,7 +296,7 @@ impl CoarseProjection {
             cents_p_norms,
             cents_p_norms_sqrt,
             cents_p_errors,
-        })
+        }
     }
 
     pub fn dimension(&self) -> usize {
@@ -233,9 +353,8 @@ impl CoarseProjection {
                     let x_i = &x[i * d..(i + 1) * d];
                     let x_error = projection_error(norm_upper(x_i), d, dp);
                     let ip_i = &ip[i * nlist..(i + 1) * nlist];
-                    let mut first = 0usize;
                     for c in 0..nlist {
-                        let bound = projected_distance_lower_bound(
+                        bounds[c] = projected_distance_lower_bound(
                             xn,
                             xn_sqrt,
                             self.cents_p_norms[c],
@@ -245,11 +364,9 @@ impl CoarseProjection {
                             gemm_error_factor,
                             f64_error_factor,
                         );
-                        bounds[c] = bound;
-                        if bound < bounds[first] {
-                            first = c;
-                        }
                     }
+                    let min_bound = bounds.iter().copied().fold(f64::INFINITY, f64::min);
+                    let first = bounds.iter().position(|&b| b == min_bound).unwrap_or(0);
                     let mut best = fvec_l2sqr(x_i, &cents[first * d..(first + 1) * d]);
                     let mut best_idx = first;
                     evaluations += 1;
@@ -260,19 +377,38 @@ impl CoarseProjection {
                             candidates.push((bound, c as u32));
                         }
                     }
-                    candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-                    for &(bound, c) in &candidates {
-                        if bound > best_upper {
+                    // Evaluate in stages of the `STAGE` smallest bounds: the
+                    // best distance usually drops within the first few exact
+                    // checks, which prunes the rest without sorting them.
+                    let mut pending = candidates.as_mut_slice();
+                    while !pending.is_empty() {
+                        let stage = STAGE.min(pending.len());
+                        if stage < pending.len() {
+                            pending.select_nth_unstable_by(stage - 1, compare_bound_then_index);
+                        }
+                        let (head, tail) = pending.split_at_mut(stage);
+                        head.sort_unstable_by(compare_bound_then_index);
+                        evaluations += evaluate_candidates(
+                            x_i,
+                            cents,
+                            d,
+                            head,
+                            &mut best,
+                            &mut best_idx,
+                            &mut best_upper,
+                        );
+                        // Everything left has a bound >= the last of `head`.
+                        if head.last().is_some_and(|&(bound, _)| bound > best_upper) {
                             break;
                         }
-                        let c = c as usize;
-                        let dist = fvec_l2sqr(x_i, &cents[c * d..(c + 1) * d]);
-                        evaluations += 1;
-                        if dist < best || (dist == best && c < best_idx) {
-                            best = dist;
-                            best_idx = c;
-                            best_upper = distance_upper_bound(best, d);
+                        let mut kept = 0;
+                        for j in 0..tail.len() {
+                            if tail[j].0 <= best_upper {
+                                tail.swap(kept, j);
+                                kept += 1;
+                            }
                         }
+                        pending = &mut tail[..kept];
                     }
                     chunk[i] = best_idx;
                 }
@@ -402,6 +538,63 @@ fn make_contractive(proj: &mut [f32], rows: usize, d: usize) {
     for value in proj {
         *value *= scale as f32;
     }
+}
+
+fn compare_bound_then_index(a: &(f64, u32), b: &(f64, u32)) -> std::cmp::Ordering {
+    a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))
+}
+
+/// Exact distances for `head` (sorted by bound), four centroids at a time,
+/// stopping once a bound cannot beat `best`. Returns the evaluation count.
+fn evaluate_candidates(
+    x: &[f32],
+    cents: &[f32],
+    d: usize,
+    head: &[(f64, u32)],
+    best: &mut f32,
+    best_idx: &mut usize,
+    best_upper: &mut f64,
+) -> usize {
+    let mut evaluations = 0;
+    let mut pos = 0;
+    while pos < head.len() {
+        if head[pos].0 > *best_upper {
+            break;
+        }
+        let take = 4.min(head.len() - pos);
+        let ids = [
+            head[pos].1 as usize,
+            head[(pos + 1).min(head.len() - 1)].1 as usize,
+            head[(pos + 2).min(head.len() - 1)].1 as usize,
+            head[(pos + 3).min(head.len() - 1)].1 as usize,
+        ];
+        let dists = if take == 4 {
+            fvec_l2sqr_four(
+                x,
+                &cents[ids[0] * d..(ids[0] + 1) * d],
+                &cents[ids[1] * d..(ids[1] + 1) * d],
+                &cents[ids[2] * d..(ids[2] + 1) * d],
+                &cents[ids[3] * d..(ids[3] + 1) * d],
+            )
+        } else {
+            let mut dists = [f32::INFINITY; 4];
+            for (k, dist) in dists.iter_mut().enumerate().take(take) {
+                *dist = fvec_l2sqr(x, &cents[ids[k] * d..(ids[k] + 1) * d]);
+            }
+            dists
+        };
+        evaluations += take;
+        for k in 0..take {
+            let c = ids[k];
+            if dists[k] < *best || (dists[k] == *best && c < *best_idx) {
+                *best = dists[k];
+                *best_idx = c;
+            }
+        }
+        *best_upper = distance_upper_bound(*best, d);
+        pos += take;
+    }
+    evaluations
 }
 
 fn column_mean(data: &[f32], n: usize, d: usize) -> Vec<f32> {
@@ -575,7 +768,7 @@ mod tests {
     fn projection_is_contractive() {
         let (nlist, d) = (512, 96);
         let cents = low_rank_centroids(nlist, d, 12, 0.05, 1);
-        let p = CoarseProjection::train(&cents, nlist, d, true).unwrap();
+        let p = CoarseProjection::train(&cents, nlist, d, true, &[], 0).unwrap();
         let mut max_row_sum = 0.0f64;
         for a in 0..p.dp {
             let mut row_sum = 0.0;
@@ -596,29 +789,29 @@ mod tests {
     fn auto_mode_keeps_compressible_centroids_and_rejects_noise() {
         let (nlist, d) = (512, 96);
         let structured = low_rank_centroids(nlist, d, 12, 0.05, 2);
-        let p = CoarseProjection::train(&structured, nlist, d, false).unwrap();
+        let p = CoarseProjection::train(&structured, nlist, d, false, &[], 0).unwrap();
         assert!(p.dimension() * MAX_AUTO_DP_DIVISOR <= d);
         assert!(p.explained_variance() >= VARIANCE_TARGET);
 
         let mut rng = StdRng::seed_from_u64(3);
         let noise: Vec<f32> = (0..nlist * d).map(|_| rng.gen::<f32>()).collect();
-        assert!(CoarseProjection::train(&noise, nlist, d, false).is_none());
+        assert!(CoarseProjection::train(&noise, nlist, d, false, &[], 0).is_none());
         // Forced mode still builds one (and stays exact).
-        assert!(CoarseProjection::train(&noise, nlist, d, true).is_some());
+        assert!(CoarseProjection::train(&noise, nlist, d, true, &[], 0).is_some());
     }
 
     #[test]
     fn train_rejects_degenerate_inputs() {
-        assert!(CoarseProjection::train(&[], 0, 16, true).is_none());
-        assert!(CoarseProjection::train(&vec![1.0; 4 * 16], 4, 16, false).is_none());
-        assert!(CoarseProjection::train(&vec![1.0; 64 * 16], 64, 16, true).is_none());
+        assert!(CoarseProjection::train(&[], 0, 16, true, &[], 0).is_none());
+        assert!(CoarseProjection::train(&vec![1.0; 4 * 16], 4, 16, false, &[], 0).is_none());
+        assert!(CoarseProjection::train(&vec![1.0; 64 * 16], 64, 16, true, &[], 0).is_none());
     }
 
     #[test]
     fn lower_bound_never_exceeds_distance() {
         let (nlist, d) = (256, 64);
         let cents = low_rank_centroids(nlist, d, 8, 0.3, 4);
-        let p = CoarseProjection::train(&cents, nlist, d, true).unwrap();
+        let p = CoarseProjection::train(&cents, nlist, d, true, &[], 0).unwrap();
         let rows = rows_like(&cents, nlist, d, 200, 1.0, 5);
         for i in 0..200 {
             let x = &rows[i * d..(i + 1) * d];
@@ -639,7 +832,7 @@ mod tests {
         let (nlist, d, n) = (512, 96, 3000);
         let cents = low_rank_centroids(nlist, d, 12, 0.05, 6);
         let rows = rows_like(&cents, nlist, d, n, 0.4, 7);
-        let p = CoarseProjection::train(&cents, nlist, d, false).unwrap();
+        let p = CoarseProjection::train(&cents, nlist, d, false, &[], 0).unwrap();
         let (got, evaluations) = p.assign_with_stats(&rows, n, &cents, nlist);
         let exact: Vec<usize> = rows
             .chunks_exact(d)
@@ -658,7 +851,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(8);
         let cents: Vec<f32> = (0..nlist * d).map(|_| rng.gen::<f32>()).collect();
         let rows: Vec<f32> = (0..n * d).map(|_| rng.gen::<f32>()).collect();
-        let p = CoarseProjection::train(&cents, nlist, d, true).unwrap();
+        let p = CoarseProjection::train(&cents, nlist, d, true, &[], 0).unwrap();
         let got = p.assign(&rows, n, &cents, nlist);
         let exact: Vec<usize> = rows
             .chunks_exact(d)
@@ -689,13 +882,39 @@ mod tests {
             .into_iter()
             .flat_map(|c| cents[c * d..(c + 1) * d].iter().copied())
             .collect();
-        let p = CoarseProjection::train(&cents, nlist, d, true).unwrap();
+        let p = CoarseProjection::train(&cents, nlist, d, true, &[], 0).unwrap();
         let got = p.assign(&rows, 3, &cents, nlist);
         let exact: Vec<usize> = rows
             .chunks_exact(d)
             .map(|x| kmeans::find_nearest(x, &cents, nlist, d))
             .collect();
         assert_eq!(got, exact);
+    }
+
+    #[test]
+    fn calibration_picks_a_cheaper_width_and_gates_on_cost() {
+        let (nlist, d) = (512, 96);
+        let cents = low_rank_centroids(nlist, d, 12, 0.3, 31);
+        let rows = rows_like(&cents, nlist, d, 4000, 1.0, 32);
+        let calibrated = CoarseProjection::train(&cents, nlist, d, false, &rows, 2048).unwrap();
+        let variance_rule = CoarseProjection::train(&cents, nlist, d, false, &[], 0).unwrap();
+        let (_, cal_evals) = calibrated.assign_with_stats(&rows[2048 * d..], 1952, &cents, nlist);
+        let (_, var_evals) =
+            variance_rule.assign_with_stats(&rows[2048 * d..], 1952, &cents, nlist);
+        let cost = |dp: usize, evals: usize| (dp * nlist + evals * d / 1952) as f64;
+        assert!(
+            cost(calibrated.dimension(), cal_evals) <= cost(variance_rule.dimension(), var_evals),
+            "calibrated d'={} ({cal_evals} checks) vs variance d'={} ({var_evals} checks)",
+            calibrated.dimension(),
+            variance_rule.dimension()
+        );
+        // Unstructured rows: the modeled cost exceeds the scan, auto declines.
+        let mut rng = StdRng::seed_from_u64(33);
+        let noise_cents: Vec<f32> = (0..nlist * d).map(|_| rng.gen::<f32>()).collect();
+        let noise_rows: Vec<f32> = (0..1024 * d).map(|_| rng.gen::<f32>()).collect();
+        assert!(
+            CoarseProjection::train(&noise_cents, nlist, d, false, &noise_rows, 1024).is_none()
+        );
     }
 
     #[test]
@@ -706,7 +925,7 @@ mod tests {
         let dup: Vec<f32> = cents[40 * d..41 * d].to_vec();
         cents[3 * d..4 * d].copy_from_slice(&dup);
         cents[50 * d..51 * d].copy_from_slice(&dup);
-        let p = CoarseProjection::train(&cents, nlist, d, true).unwrap();
+        let p = CoarseProjection::train(&cents, nlist, d, true, &[], 0).unwrap();
         let mut row = dup.clone();
         row[0] += 0.01;
         let got = p.assign(&row, 1, &cents, nlist);
