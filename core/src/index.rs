@@ -309,7 +309,6 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 m,
                 metric,
                 use_opq,
-                ..
             } => Self {
                 index_type: IndexType::IvfPq,
                 dimension: *dimension,

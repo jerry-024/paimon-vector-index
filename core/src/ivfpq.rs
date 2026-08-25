@@ -331,6 +331,7 @@ impl IVFPQIndex {
             self.ids[list_id].push(ids[i]);
             self.codes[list_id].extend_from_slice(&codes[i * code_size..(i + 1) * code_size]);
         }
+
         if !self.fastscan_codes.is_empty() {
             self.fastscan_codes.clear();
         }

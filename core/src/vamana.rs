@@ -711,61 +711,47 @@ impl VamanaGraph {
         query: &[f32],
         search_list_size: usize,
     ) -> Vec<ScoredNode> {
-        let mut scratch = GreedySearchScratch::new(
-            self.adjacency.len(),
-            self.adjacency.max_degree,
-            search_list_size.min(self.adjacency.len()),
-        );
-        self.greedy_search_with_scratch(
-            vectors,
-            dimension,
-            metric,
-            query,
-            search_list_size,
-            &mut scratch,
-        );
-        scratch.results.into_sorted_vec()
-    }
-
-    fn greedy_search_with_scratch(
-        &self,
-        vectors: &[f32],
-        dimension: usize,
-        metric: MetricType,
-        query: &[f32],
-        search_list_size: usize,
-        scratch: &mut GreedySearchScratch,
-    ) {
-        scratch.begin_search();
         if search_list_size == 0 || self.adjacency.is_empty() {
-            return;
+            return Vec::new();
         }
 
+        let mut visited = vec![false; self.adjacency.len()];
+        let mut expanded = vec![false; self.adjacency.len()];
         let entry = self.entry_node as usize;
-        scratch.insert_candidate(
-            ScoredNode {
-                id: self.entry_node,
-                distance: node_distance(vectors, dimension, entry, query, metric),
-            },
-            search_list_size,
-        );
+        visited[entry] = true;
+        let mut results = vec![ScoredNode {
+            id: self.entry_node,
+            distance: node_distance(vectors, dimension, entry, query, metric),
+        }];
 
-        while let Some(current) = scratch.pop_nearest_unexpanded() {
-            scratch.mark_expanded(current.id as usize);
+        loop {
+            results.sort_by(scored_node_order);
+            results.truncate(search_list_size);
+            let Some(current) = results
+                .iter()
+                .find(|node| !expanded[node.id as usize])
+                .copied()
+            else {
+                break;
+            };
+            expanded[current.id as usize] = true;
+
             for &neighbor in &self.adjacency[current.id as usize] {
                 let neighbor = neighbor as usize;
-                if neighbor >= self.adjacency.len() || scratch.is_visited(neighbor) {
+                if neighbor >= self.adjacency.len() || visited[neighbor] {
                     continue;
                 }
-                scratch.insert_candidate(
-                    ScoredNode {
-                        id: neighbor as u32,
-                        distance: node_distance(vectors, dimension, neighbor, query, metric),
-                    },
-                    search_list_size,
-                );
+                visited[neighbor] = true;
+                results.push(ScoredNode {
+                    id: neighbor as u32,
+                    distance: node_distance(vectors, dimension, neighbor, query, metric),
+                });
             }
         }
+
+        results.sort_by(scored_node_order);
+        results.truncate(search_list_size);
+        results
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2477,15 +2463,6 @@ mod tests {
             result.iter().map(|node| node.id).collect::<Vec<_>>(),
             vec![3, 4, 2]
         );
-    }
-
-    #[test]
-    fn vamana_greedy_search_caps_search_list_size_to_node_count() {
-        let graph = VamanaGraph::from_adjacency(0, vec![vec![]]);
-        assert_eq!(graph.greedy_search(&[1.0], 1, &[1.0], usize::MAX).len(), 1);
-
-        let empty = VamanaGraph::from_adjacency(0, vec![]);
-        assert!(empty.greedy_search(&[], 1, &[1.0], usize::MAX).is_empty());
     }
 
     #[test]

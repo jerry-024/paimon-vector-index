@@ -48,7 +48,7 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
 /// Fraction of centroid variance the projection must explain.
-pub const VARIANCE_TARGET: f64 = 0.95;
+const VARIANCE_TARGET: f64 = 0.95;
 /// Automatic mode keeps the projection only when `d' * MAX_AUTO_DP_DIVISOR <= d`.
 const MAX_AUTO_DP_DIVISOR: usize = 3;
 /// Block subspace iterations; the bound stays valid regardless of convergence.
@@ -102,7 +102,7 @@ impl CoarseProjection {
     /// Returns `None` when the projection is not worth it (`force == false`)
     /// or cannot be built: too few centroids, zero variance, or a `d'` that
     /// would not shrink the GEMM by at least `MAX_AUTO_DP_DIVISOR`.
-    pub fn train(cents: &[f32], nlist: usize, d: usize, force: bool) -> Option<Self> {
+    pub(crate) fn train(cents: &[f32], nlist: usize, d: usize, force: bool) -> Option<Self> {
         if nlist == 0 || d == 0 {
             return None;
         }
@@ -191,13 +191,13 @@ impl CoarseProjection {
 
     /// Exact nearest centroid of every row (ties: smallest centroid index).
     /// `data` must already be in the centroid space (normalized / rotated).
-    pub fn assign(&self, data: &[f32], n: usize, cents: &[f32], nlist: usize) -> Vec<usize> {
+    pub(crate) fn assign(&self, data: &[f32], n: usize, cents: &[f32], nlist: usize) -> Vec<usize> {
         self.assign_with_stats(data, n, cents, nlist).0
     }
 
     /// `assign` plus the total number of exact distance evaluations, for
     /// tests and benchmarks.
-    pub fn assign_with_stats(
+    fn assign_with_stats(
         &self,
         data: &[f32],
         n: usize,
@@ -208,9 +208,6 @@ impl CoarseProjection {
         let dp = self.dp;
         debug_assert_eq!(self.cents_p.len(), nlist * dp);
         let mut out = vec![0usize; n];
-        if n == 0 {
-            return (out, 0);
-        }
         let block_rows = (MAX_BLOCK_SCORES / nlist.max(1)).clamp(1, MAX_BLOCK_ROWS);
         let evaluations = out
             .par_chunks_mut(block_rows)

@@ -644,7 +644,6 @@ fn score_argmin(q: &[f32], t: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
 
 #[inline]
 fn score_argmin_scalar(q: &[f32], t: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
-    let dsub = q.len();
     scores[..ksub].fill(0.0);
     for (k, &qv) in q.iter().enumerate() {
         let tk = &t[k * ksub..(k + 1) * ksub];
@@ -653,7 +652,7 @@ fn score_argmin_scalar(q: &[f32], t: &[f32], ksub: usize, scores: &mut [f32]) ->
             scores[j] = diff.mul_add(diff, scores[j]);
         }
     }
-    debug_assert_eq!(dsub * ksub, t.len());
+    debug_assert_eq!(q.len() * ksub, t.len());
     argmin_code(&scores[..ksub])
 }
 
