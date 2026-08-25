@@ -37,7 +37,8 @@
 //! degrade to checking every centroid, i.e. the exact scan plus one small
 //! GEMM. `d'` is therefore chosen by cost: at `train`, candidate widths are
 //! tried on a sample of training vectors, the number of exact checks each
-//! needs is measured, and the width minimizing `d'·nlist + w·checks·d` wins;
+//! needs is measured, and the width minimizing
+//! `d'·nlist + 2·d'·d + w·checks·d` wins;
 //! automatic mode keeps the projection only when that cost is below
 //! the exact scan's `d·nlist`. (Without a sample the width falls back to 95%
 //! explained variance, gated by `d' ≤ d / 3`.)
@@ -63,6 +64,9 @@ const MIN_CALIBRATION_ROWS: usize = 256;
 pub(crate) const CALIBRATION_ROWS: usize = 2048;
 /// Per-centroid cost of computing one bound, in GEMM multiply-add units.
 const BOUND_COST: f64 = 4.0;
+/// Row projection uses f64, with roughly half the SIMD lane throughput of the
+/// f32 projected-score GEMM.
+const ROW_PROJECTION_WEIGHT: f64 = 2.0;
 /// Cost of one exact-check multiply-add relative to a GEMM multiply-add:
 /// exact checks gather scattered centroids row by row, with no blocking.
 /// Fitted on Cohere-768 / nlist=4096 timings across d' = 32..384.
@@ -98,7 +102,7 @@ pub enum ProjectedAssignment {
 
 /// Contractive projection of the coarse centroids plus the per-centroid data
 /// the lower bound needs.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CoarseProjection {
     d: usize,
     dp: usize,
@@ -119,6 +123,8 @@ pub struct CoarseProjection {
     cents_p_norms_sqrt: Vec<f64>,
     /// Upper bound on the f32 GEMM error in each projected centroid.
     cents_p_errors: Vec<f64>,
+    /// `|c - mean|²`, reused while calibrating narrower projections.
+    cent_norms: Vec<f64>,
     /// Bounds on the squared singular values of `proj`: `|P v|² / sigma_max_sq
     /// <= |P₀ v|² <= |P v|² / sigma_min_sq` for the orthonormal basis `P₀` of
     /// its row space. `sigma_min_sq == 0` disables the residual term.
@@ -137,7 +143,8 @@ impl CoarseProjection {
     /// space (typically training vectors). When present, `d'` is chosen by
     /// measuring, for each candidate width, how many exact distance checks
     /// the branch-and-bound needs on that sample and picking the width that
-    /// minimizes `d' * nlist + EXACT_CHECK_WEIGHT * checks * d`; automatic mode then keeps the
+    /// minimizes `d' * nlist + ROW_PROJECTION_WEIGHT * d' * d +
+    /// EXACT_CHECK_WEIGHT * checks * d`; automatic mode then keeps the
     /// projection only when that cost is clearly below the exact scan's
     /// `d * nlist`. Without a sample, `d'` falls back to the smallest width
     /// explaining `VARIANCE_TARGET` of the centroid variance, gated by
@@ -187,8 +194,8 @@ impl CoarseProjection {
 
         let (basis, eigenvalues) = top_subspace(&centered, nlist, d, block);
         let calibration_rows = calibration_rows.min(calibration.len() / d.max(1));
-        let dp = if calibration_rows >= MIN_CALIBRATION_ROWS {
-            Self::select_width_by_cost(
+        if calibration_rows >= MIN_CALIBRATION_ROWS {
+            let mut projection = Self::select_width_by_cost(
                 cents,
                 &basis,
                 nlist,
@@ -197,10 +204,12 @@ impl CoarseProjection {
                 force,
                 &calibration[..calibration_rows * d],
                 calibration_rows,
-            )?
-        } else {
-            Self::select_width_by_variance(&eigenvalues, total_variance, block, d, force)?
-        };
+            )?;
+            projection.explained_variance =
+                eigenvalues[..projection.dp].iter().sum::<f64>() / total_variance;
+            return Some(projection);
+        }
+        let dp = Self::select_width_by_variance(&eigenvalues, total_variance, block, d, force)?;
         let explained_variance = eigenvalues[..dp].iter().sum::<f64>() / total_variance;
         Some(Self::from_basis(
             cents,
@@ -253,41 +262,96 @@ impl CoarseProjection {
         force: bool,
         calibration: &[f32],
         calibration_rows: usize,
-    ) -> Option<usize> {
+    ) -> Option<Self> {
         let exact_cost = (d * nlist) as f64;
-        let mut best: Option<(f64, usize)> = None;
+        let mut best: Option<(f64, Self)> = None;
         let mut widths: Vec<usize> = [8usize, 4, 2]
             .iter()
             .map(|div| (block / div).div_ceil(MIN_DP) * MIN_DP)
             .chain([(block * 3 / 4).div_ceil(MIN_DP) * MIN_DP, block])
             .filter(|&w| w >= MIN_DP && w <= block)
             .collect();
+        if force && widths.is_empty() {
+            widths.push(block);
+        }
         widths.sort_unstable();
         widths.dedup();
-        for dp in widths {
-            let candidate = Self::from_basis(cents, basis, nlist, d, dp, 0.0);
+        let mut candidate = Self::from_basis(cents, basis, nlist, d, block, 0.0);
+        for dp in widths.into_iter().rev() {
+            candidate.truncate_dimension(dp);
             let (_, evaluations) =
                 candidate.assign_with_stats(calibration, calibration_rows, cents, nlist);
             let checks_per_row = evaluations as f64 / calibration_rows as f64;
-            let cost = (dp * nlist) as f64
+            let cost = dp as f64 * nlist as f64
+                + ROW_PROJECTION_WEIGHT * dp as f64 * d as f64
                 + EXACT_CHECK_WEIGHT * checks_per_row * d as f64
                 + BOUND_COST * nlist as f64;
-            if best.is_none_or(|(c, _)| cost < c) {
-                best = Some((cost, dp));
+            if best.as_ref().is_none_or(|(c, _)| cost <= *c) {
+                best = Some((cost, candidate.clone()));
             }
         }
-        let (cost, dp) = best?;
+        let (cost, candidate) = best?;
         if !force && cost > exact_cost * MAX_AUTO_COST_FRACTION {
             crate::logging::emit_log(
                 crate::logging::LogLevel::Info,
                 &format!(
-                    "IVF-PQ projected assignment not used: best width d'={dp} models {:.0}% of the exact scan cost",
+                    "IVF-PQ projected assignment not used: best width d'={} models {:.0}% of the exact scan cost",
+                    candidate.dp,
                     cost / exact_cost * 100.0
                 ),
             );
             return None;
         }
-        Some(dp)
+        Some(candidate)
+    }
+
+    fn truncate_dimension(&mut self, dp: usize) {
+        if dp == self.dp {
+            return;
+        }
+        debug_assert!(dp < self.dp);
+        let old_dp = self.dp;
+        self.proj.truncate(dp * self.d);
+        self.cents_p = self
+            .cents_p
+            .chunks_exact(old_dp)
+            .flat_map(|row| row[..dp].iter().copied())
+            .collect();
+        self.dp = dp;
+
+        // By eigenvalue interlacing, the full-width singular-value bounds are
+        // conservative for every row prefix.
+        self.cents_p_norms = self.cents_p.chunks_exact(dp).map(norm_l2sqr_f64).collect();
+        self.cents_p_norms_sqrt = self.cents_p_norms.iter().map(|norm| norm.sqrt()).collect();
+        self.cents_p_errors = self
+            .cents_p_norms_sqrt
+            .iter()
+            .zip(&self.cent_norms)
+            .map(|(proj_norm, &cent_norm)| {
+                projection_error(
+                    centered_norm_upper(cent_norm, self.d),
+                    *proj_norm,
+                    self.d,
+                    dp,
+                )
+            })
+            .collect();
+        (self.cents_res_lo, self.cents_res_hi) = self
+            .cent_norms
+            .iter()
+            .zip(&self.cents_p_norms)
+            .zip(&self.cents_p_errors)
+            .map(|((&cent_norm, &proj_norm), &error)| {
+                residual_interval(
+                    cent_norm,
+                    self.d,
+                    proj_norm,
+                    error,
+                    self.sigma_min_sq,
+                    self.sigma_max_sq,
+                )
+            })
+            .unzip();
     }
 
     fn from_basis(
@@ -345,6 +409,7 @@ impl CoarseProjection {
             cents_p_norms,
             cents_p_norms_sqrt,
             cents_p_errors,
+            cent_norms,
             sigma_min_sq,
             sigma_max_sq,
             cents_res_lo,
@@ -1098,16 +1163,42 @@ mod tests {
     }
 
     #[test]
+    fn forced_calibration_keeps_width_below_min_dp() {
+        let (nlist, d) = (4, 16);
+        let cents = low_rank_centroids(nlist, d, 2, 0.1, 30);
+        let rows = rows_like(&cents, nlist, d, MIN_CALIBRATION_ROWS, 1.0, 31);
+        let p =
+            CoarseProjection::train(&cents, nlist, d, true, &rows, MIN_CALIBRATION_ROWS).unwrap();
+        assert_eq!(p.dimension(), nlist);
+        assert_eq!(p.assign(&rows, MIN_CALIBRATION_ROWS, &cents, nlist), {
+            rows.chunks_exact(d)
+                .map(|x| kmeans::find_nearest(x, &cents, nlist, d))
+                .collect::<Vec<_>>()
+        });
+    }
+
+    #[test]
     fn calibration_picks_a_cheaper_width_and_gates_on_cost() {
         let (nlist, d) = (512, 96);
         let cents = low_rank_centroids(nlist, d, 12, 0.3, 31);
         let rows = rows_like(&cents, nlist, d, 4000, 1.0, 32);
         let calibrated = CoarseProjection::train(&cents, nlist, d, false, &rows, 2048).unwrap();
         let variance_rule = CoarseProjection::train(&cents, nlist, d, false, &[], 0).unwrap();
-        let (_, cal_evals) = calibrated.assign_with_stats(&rows[2048 * d..], 1952, &cents, nlist);
+        assert!(calibrated.dimension() < d / MAX_AUTO_DP_DIVISOR);
+        let (got, cal_evals) = calibrated.assign_with_stats(&rows[2048 * d..], 1952, &cents, nlist);
+        let exact: Vec<usize> = rows[2048 * d..]
+            .chunks_exact(d)
+            .map(|x| kmeans::find_nearest(x, &cents, nlist, d))
+            .collect();
+        assert_eq!(got, exact);
         let (_, var_evals) =
             variance_rule.assign_with_stats(&rows[2048 * d..], 1952, &cents, nlist);
-        let cost = |dp: usize, evals: usize| (dp * nlist + evals * d / 1952) as f64;
+        let cost = |dp: usize, evals: usize| {
+            dp as f64 * nlist as f64
+                + ROW_PROJECTION_WEIGHT * dp as f64 * d as f64
+                + EXACT_CHECK_WEIGHT * evals as f64 * d as f64 / 1952.0
+                + BOUND_COST * nlist as f64
+        };
         assert!(
             cost(calibrated.dimension(), cal_evals) <= cost(variance_rule.dimension(), var_evals),
             "calibrated d'={} ({cal_evals} checks) vs variance d'={} ({var_evals} checks)",

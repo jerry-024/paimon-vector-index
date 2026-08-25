@@ -84,6 +84,9 @@ pub struct IVFPQIndex {
     /// instead of a full scan. Derived from the centroids in `train`, shared
     /// by `from_trained`, never serialized.
     coarse_projection: Option<Arc<CoarseProjection>>,
+    /// Exact centroids used to build `coarse_projection`. Kept separately
+    /// because `quantizer_centroids` is public and may be mutated directly.
+    coarse_projection_centroids: Option<Arc<[f32]>>,
     pub(crate) projected_assignment: ProjectedAssignment,
 }
 
@@ -122,6 +125,7 @@ impl IVFPQIndex {
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
             coarse_projection: None,
+            coarse_projection_centroids: None,
             projected_assignment: ProjectedAssignment::Auto,
         }
     }
@@ -140,6 +144,7 @@ impl IVFPQIndex {
             self.rebuild_coarse_projection();
         } else {
             self.coarse_projection = None;
+            self.coarse_projection_centroids = None;
         }
     }
 
@@ -196,12 +201,14 @@ impl IVFPQIndex {
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
             coarse_projection: trained.coarse_projection.clone(),
+            coarse_projection_centroids: trained.coarse_projection_centroids.clone(),
             projected_assignment: trained.projected_assignment,
         }
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
         self.coarse_projection = None;
+        self.coarse_projection_centroids = None;
         let d = self.d;
 
         let train_data = if self.metric == MetricType::Cosine {
@@ -254,6 +261,7 @@ impl IVFPQIndex {
     /// width by measured cost; without it the variance rule applies.
     fn rebuild_coarse_projection_with(&mut self, calibration: &[f32], rows: usize) {
         self.coarse_projection = None;
+        self.coarse_projection_centroids = None;
         let force = match self.projected_assignment {
             ProjectedAssignment::Disabled => return,
             ProjectedAssignment::Enabled => true,
@@ -284,11 +292,21 @@ impl IVFPQIndex {
             None => {}
         }
         self.coarse_projection = projection.map(Arc::new);
+        if self.coarse_projection.is_some() {
+            self.coarse_projection_centroids = Some(Arc::from(self.quantizer_centroids.as_slice()));
+        }
     }
 
     /// Add vectors in batches (Faiss-style: batch assign → batch residual → batch encode).
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
         const BATCH_SIZE: usize = 32768;
+        if self.coarse_projection.is_some()
+            && self.coarse_projection_centroids.as_deref()
+                != Some(self.quantizer_centroids.as_slice())
+        {
+            self.coarse_projection = None;
+            self.coarse_projection_centroids = None;
+        }
         let mut offset = 0;
         while offset < n {
             let batch_n = (n - offset).min(BATCH_SIZE);
@@ -3237,11 +3255,19 @@ mod tests {
         let mut trained = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false);
         trained.train(&data, n);
         let projection = trained.coarse_projection.clone().expect("projection");
+        let projection_centroids = trained
+            .coarse_projection_centroids
+            .clone()
+            .expect("projection centroids");
 
         let worker = IVFPQIndex::from_trained(&trained);
         assert!(Arc::ptr_eq(
             &projection,
             worker.coarse_projection.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &projection_centroids,
+            worker.coarse_projection_centroids.as_ref().unwrap()
         ));
 
         trained.train(&data, n);
@@ -3256,6 +3282,25 @@ mod tests {
         let ids: Vec<i64> = (0..n as i64).collect();
         trained.add(&data, &ids, n);
         assert_buckets_match_exact(&trained, &data, n);
+    }
+
+    #[test]
+    fn test_mutated_centroids_drop_stale_projection() {
+        let d = 16;
+        let nlist = 4;
+        let n = 500;
+        let data = generate_clustered_data(n, d, nlist, 27);
+        let mut index = IVFPQIndex::new(d, nlist, 4, MetricType::L2, false)
+            .with_projected_assignment(ProjectedAssignment::Enabled);
+        index.train(&data, n);
+        assert!(index.coarse_projection().is_some());
+
+        index.quantizer_centroids[0] += 1.0;
+        index.add(&data[..d], &[0], 1);
+
+        assert!(index.coarse_projection().is_none());
+        assert!(index.coarse_projection_centroids.is_none());
+        assert_buckets_match_exact(&index, &data[..d], 1);
     }
 
     #[test]
