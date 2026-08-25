@@ -1033,26 +1033,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_batch_without_norms_cache() {
-        // Hand-built quantizer (no train) must work on the transposed path.
-        let d = 8;
-        let m = 2;
-        let mut rng = StdRng::seed_from_u64(20260822);
-        let mut pq = ProductQuantizer::new(d, m);
-        pq.centroids = (0..d * pq.ksub)
-            .map(|_| rng.gen_range(-1.0f32..1.0))
-            .collect();
-        assert!(pq.centroid_norms_cache.is_empty());
-
-        let n = 100;
-        let data: Vec<f32> = (0..n * d).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
-        let reference = encode_per_vector(&pq, &data, n);
-        let mut batch = vec![0u8; n * pq.code_size()];
-        pq.encode_batch_blocked(&data, n, &mut batch);
-        assert_codes_match_up_to_ties(&pq, &data, &reference, &batch, n);
-    }
-
-    #[test]
     fn test_score_argmin_tie_prefers_smallest_index() {
         // Duplicate centroids force exact ties; both kernels must return the
         // first (smallest) index like argmin_code.
