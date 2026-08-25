@@ -336,12 +336,18 @@ impl IVFPQIndex {
     }
 
     /// Add vectors in batches (Faiss-style: batch assign → batch residual → batch encode).
+    ///
+    /// # Panics
+    ///
+    /// Panics if explicit approximate assignment cannot build its centroid graph. Use
+    /// [`Self::try_add`] to handle that error.
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
         self.try_add(data, ids, n)
             .expect("explicit IVF-PQ approximate assignment graph build failed");
     }
 
-    pub(crate) fn try_add(&mut self, data: &[f32], ids: &[i64], n: usize) -> io::Result<()> {
+    /// Add vectors, returning an error if explicit approximate assignment cannot build its graph.
+    pub fn try_add(&mut self, data: &[f32], ids: &[i64], n: usize) -> io::Result<()> {
         const BATCH_SIZE: usize = 32768;
         let mut offset = 0;
         while offset < n {
@@ -3216,6 +3222,14 @@ mod tests {
             IVFPQIndex::new(16, 1024, 4, MetricType::L2, false).with_approximate_assignment(true);
         assert!(explicit.rebuild_assign_graph().is_err());
         assert!(explicit.approximate_assignment);
+    }
+
+    #[test]
+    fn test_try_add_returns_explicit_assign_graph_failure() {
+        let mut index =
+            IVFPQIndex::new(16, 1024, 4, MetricType::L2, false).with_approximate_assignment(true);
+
+        assert!(index.try_add(&[0.0; 16], &[0], 1).is_err());
     }
 
     /// With nlist above the threshold and explicit opt-in, the graph is built, and approximate
