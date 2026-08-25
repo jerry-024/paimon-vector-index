@@ -40,9 +40,6 @@ const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
 const APPROX_ASSIGN_MEMORY_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 /// Match Lance's automatic cutoff for graph-based centroid assignment.
 const APPROX_ASSIGN_MIN_CENTROID_VALUES: usize = 1_000_000;
-/// Avoid building the centroid graph for short-lived writers where its startup
-/// cost cannot be amortized.
-const AUTO_APPROX_ASSIGN_MIN_ROWS: usize = 16 * 1024;
 
 pub(crate) fn use_approximate_assignment(d: usize, nlist: usize) -> bool {
     d.saturating_mul(nlist) >= APPROX_ASSIGN_MIN_CENTROID_VALUES
@@ -117,15 +114,14 @@ pub struct IVFPQIndex {
     /// Block-layout packed codes for 4-bit FastScan. One per list.
     fastscan_codes: Vec<Vec<u8>>,
     /// Build-only Vamana graph over the coarse centroids for approximate
-    /// assignment during `add`. Never serialized; built lazily once automatic
-    /// assignment has enough rows, or on the first explicitly enabled `add`.
+    /// assignment during `add`. Never serialized; built after training and
+    /// copied to writers created with [`Self::from_trained`].
     /// IVF bucketing is a heuristic partition, so a near-tie neighbor bucket
     /// (dist ratio ~1.01 in benchmarks) is as good as the exact argmin;
     /// queries probe multiple buckets anyway.
     assign_graph: Option<crate::vamana::VamanaGraph>,
     pub(crate) approximate_assignment: bool,
     approximate_assignment_explicit: bool,
-    auto_assignment_rows_seen: usize,
 }
 
 impl IVFPQIndex {
@@ -165,7 +161,6 @@ impl IVFPQIndex {
             assign_graph: None,
             approximate_assignment: use_approximate_assignment(d, nlist),
             approximate_assignment_explicit: false,
-            auto_assignment_rows_seen: 0,
         }
     }
 
@@ -177,7 +172,6 @@ impl IVFPQIndex {
     pub(crate) fn set_approximate_assignment(&mut self, enabled: bool) {
         self.approximate_assignment = enabled;
         self.approximate_assignment_explicit = true;
-        self.auto_assignment_rows_seen = 0;
         if !enabled {
             self.assign_graph = None;
         }
@@ -231,16 +225,14 @@ impl IVFPQIndex {
             codes: vec![Vec::new(); trained.nlist],
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
-            assign_graph: None,
+            assign_graph: trained.assign_graph.clone(),
             approximate_assignment: trained.approximate_assignment,
             approximate_assignment_explicit: trained.approximate_assignment_explicit,
-            auto_assignment_rows_seen: 0,
         }
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
         self.assign_graph = None;
-        self.auto_assignment_rows_seen = 0;
         let d = self.d;
 
         let train_data = if self.metric == MetricType::Cosine {
@@ -278,10 +270,20 @@ impl IVFPQIndex {
             effective_data
         };
         self.pq.train(&pq_train_data, n);
+        if let Err(error) = self.rebuild_assign_graph() {
+            // `train` is an infallible compatibility API. Explicit mode keeps
+            // the request enabled so the public `try_add` path can return the
+            // graph-build error instead of silently falling back to exact.
+            emit_log(
+                LogLevel::Warn,
+                &format!(
+                    "explicit IVF-PQ approximate assignment graph build failed during training; try_add will retry and return the error: {error}"
+                ),
+            );
+        }
     }
 
     /// Build the build-only centroid graph for approximate assignment.
-    /// Skipped for small nlist, where an exact scan is cheap.
     fn rebuild_assign_graph(&mut self) -> io::Result<()> {
         self.assign_graph = None;
         if !self.approximate_assignment {
@@ -363,13 +365,11 @@ impl IVFPQIndex {
     }
 
     fn add_batch(&mut self, data: &[f32], ids: &[i64], n: usize) -> io::Result<()> {
-        if self.approximate_assignment && self.assign_graph.is_none() {
-            self.auto_assignment_rows_seen = self.auto_assignment_rows_seen.saturating_add(n);
-            if self.approximate_assignment_explicit
-                || self.auto_assignment_rows_seen >= AUTO_APPROX_ASSIGN_MIN_ROWS
-            {
-                self.rebuild_assign_graph()?;
-            }
+        // A caller may explicitly enable approximate assignment after train().
+        // Build before assigning the first row so the result never depends on
+        // how the caller splits rows into add batches.
+        if self.approximate_assignment_explicit && self.assign_graph.is_none() {
+            self.rebuild_assign_graph()?;
         }
         let d = self.d;
 
@@ -3184,21 +3184,36 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_approximate_assignment_waits_for_enough_rows() {
-        let d = 4;
-        let n = 32;
-        let data = generate_clustered_data(n, d, 4, 17);
-        let ids: Vec<i64> = (0..n as i64).collect();
-        let mut index = IVFPQIndex::new(d, 4, 2, MetricType::L2, false);
-        index.train(&data, n);
-        index.approximate_assignment = true;
+    fn test_approximate_assignment_is_independent_of_add_batches() {
+        let d = 8;
+        let nlist = 16;
+        let train_n = 512;
+        let add_n = 97;
+        let train_data = generate_clustered_data(train_n, d, nlist, 17);
+        let add_data = generate_clustered_data(add_n, d, nlist, 18);
+        let ids: Vec<i64> = (0..add_n as i64).collect();
+        let mut trained = IVFPQIndex::new(d, nlist, 2, MetricType::L2, false);
+        // Exercise the automatic lifecycle without requiring a production-size
+        // dimension x nlist shape in this unit test.
+        trained.approximate_assignment = true;
+        trained.train(&train_data, train_n);
+        assert!(trained.assign_graph.is_some());
 
-        index.add(&data[..d], &ids[..1], 1);
-        assert!(index.assign_graph.is_none());
+        let mut one_batch = IVFPQIndex::from_trained(&trained);
+        assert!(one_batch.assign_graph.is_some());
+        one_batch.add(&add_data, &ids, add_n);
 
-        index.auto_assignment_rows_seen = AUTO_APPROX_ASSIGN_MIN_ROWS - 1;
-        index.add(&data[d..2 * d], &ids[1..2], 1);
-        assert!(index.assign_graph.is_some());
+        let mut split_batches = IVFPQIndex::from_trained(&trained);
+        for range in [0..1, 1..14, 14..47, 47..add_n] {
+            split_batches.add(
+                &add_data[range.start * d..range.end * d],
+                &ids[range.clone()],
+                range.len(),
+            );
+        }
+
+        assert_eq!(split_batches.ids, one_batch.ids);
+        assert_eq!(split_batches.codes, one_batch.codes);
     }
 
     #[test]
@@ -3250,7 +3265,10 @@ mod tests {
         let mut index =
             IVFPQIndex::new(d, nlist, 4, MetricType::L2, false).with_approximate_assignment(true);
         index.train(&data, n);
-        assert!(index.assign_graph.is_none(), "graph is built lazily on add");
+        assert!(
+            index.assign_graph.is_some(),
+            "graph is built during training"
+        );
         index.add(&data, &ids, n);
         assert!(
             index.assign_graph.is_some(),
@@ -3288,14 +3306,11 @@ mod tests {
 
         index.train(&data, n);
         assert!(
-            index.assign_graph.is_none(),
-            "retraining invalidates the graph"
+            index.assign_graph.is_some(),
+            "retraining rebuilds the graph for the new centroids"
         );
         index.add(&data[..d], &[n as i64], 1);
-        assert!(
-            index.assign_graph.is_some(),
-            "add rebuilds the graph lazily"
-        );
+        assert!(index.assign_graph.is_some());
     }
 
     fn observed_ephemeral_precomputed_lists(

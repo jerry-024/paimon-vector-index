@@ -382,20 +382,14 @@ impl ProductQuantizer {
     /// the centroids are transposed once to `[dsub][ksub]` so the inner
     /// distance loop is stride-1 over `ksub` and runs on SIMD (NEON/AVX2,
     /// scalar fallback). This removes the per-vector-per-sub GEMM calls and
-    /// their distance-table memory traffic. Distances use the norms identity
-    /// `argmin_j (|c_j|^2 - 2 q·c_j)`; the row's own norm is constant per
-    /// argmin and dropped. Results match [`Self::encode_batch`] except for
-    /// ulp-level argmin ties caused by the different summation order, so use
+    /// their distance-table memory traffic. Distances are accumulated directly
+    /// from coordinate differences. Results match [`Self::encode_batch`] except
+    /// for ulp-level argmin ties caused by the different summation order, so use
     /// this only where codes are freshly produced (index build), not where
     /// byte-stable output is pinned.
     pub(crate) fn encode_batch_blocked(&self, data: &[f32], n: usize, codes: &mut [u8]) {
-        // Transposing the codebook costs O(d * ksub); skip it for tiny
-        // batches and for the 4-bit packed path, which keeps the original
-        // per-vector implementation.
-        if self.nbits == 8
-            && n >= ENCODE_TRANSPOSE_MIN_ROWS
-            && (0..self.m).all(|sub| self.chunk_dim(sub) >= 4)
-        {
+        // The 4-bit packed path keeps the original per-vector implementation.
+        if self.nbits == 8 && (0..self.m).all(|sub| self.chunk_dim(sub) >= 4) {
             self.encode_batch_8bit_transposed(data, n, codes);
             return;
         }
@@ -615,9 +609,6 @@ fn argmin_code(distances: &[f32]) -> u8 {
 /// per-thread score buffer at 1 KiB and yields ~20 blocks per thread at the
 /// production 32,768-row add batch.
 const MAX_ENCODE_BLOCK_ROWS: usize = 512;
-/// Below this row count the one-time codebook transpose is not worth it.
-const ENCODE_TRANSPOSE_MIN_ROWS: usize = 32;
-
 fn encode_block_rows(rows: usize, workers: usize) -> usize {
     rows.div_ceil(workers.max(1))
         .clamp(32, MAX_ENCODE_BLOCK_ROWS)
@@ -1026,12 +1017,13 @@ mod tests {
         pq.centroids[0..4].fill(100_000_008.0);
         pq.centroids[4..8].fill(100_000_000.0);
 
-        let n = ENCODE_TRANSPOSE_MIN_ROWS;
-        let data = vec![100_000_000.0; n * pq.d];
-        let mut codes = vec![0; n];
-        pq.encode_batch_blocked(&data, n, &mut codes);
+        for n in [1, 32] {
+            let data = vec![100_000_000.0; n * pq.d];
+            let mut codes = vec![0; n];
+            pq.encode_batch_blocked(&data, n, &mut codes);
 
-        assert!(codes.iter().all(|&code| code == 1));
+            assert!(codes.iter().all(|&code| code == 1), "n={n}");
+        }
     }
 
     #[test]

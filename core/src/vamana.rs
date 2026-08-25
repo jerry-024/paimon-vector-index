@@ -236,7 +236,7 @@ impl VamanaGraph {
         GreedySearchScratch::new(
             self.adjacency.len(),
             self.adjacency.max_degree,
-            search_list_size,
+            search_list_size.min(self.adjacency.len()),
         )
     }
 
@@ -2500,6 +2500,15 @@ mod tests {
             result.iter().map(|node| node.id).collect::<Vec<_>>(),
             vec![3, 4, 2]
         );
+    }
+
+    #[test]
+    fn vamana_greedy_search_caps_search_list_size_to_node_count() {
+        let graph = VamanaGraph::from_adjacency(0, vec![vec![]]);
+        assert_eq!(graph.greedy_search(&[1.0], 1, &[1.0], usize::MAX).len(), 1);
+
+        let empty = VamanaGraph::from_adjacency(0, vec![]);
+        assert!(empty.greedy_search(&[], 1, &[1.0], usize::MAX).is_empty());
     }
 
     #[test]

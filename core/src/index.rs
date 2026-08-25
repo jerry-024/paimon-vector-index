@@ -1170,11 +1170,6 @@ impl VectorIndexTrainer {
             .transpose()?;
         config_options.values.remove("approximate-assignment");
         let config = VectorIndexConfig::from_options(&config_options.values)?;
-        if approximate_assignment.is_some() && config.index_type() != IndexType::IvfPq {
-            return Err(invalid_input(
-                "approximate-assignment is only valid for IVF-PQ",
-            ));
-        }
         match approximate_assignment {
             Some(enabled) => Self::new_with_approximate_assignment(config, enabled),
             None => Self::new(config),
@@ -1185,6 +1180,11 @@ impl VectorIndexTrainer {
         config: VectorIndexConfig,
         enabled: bool,
     ) -> io::Result<Self> {
+        if config.index_type() != IndexType::IvfPq {
+            return Err(invalid_input(
+                "approximate-assignment is only valid for IVF-PQ",
+            ));
+        }
         let mut trainer = Self::new(config)?;
         if let VectorIndexWriter::IvfPq(index) = &mut trainer.writer {
             index.set_approximate_assignment(enabled);
@@ -4213,6 +4213,23 @@ mod tests {
         ]);
         let error = VectorIndexConfig::from_options(&values).unwrap_err();
         assert!(error.to_string().contains("unknown vector index option"));
+    }
+
+    #[test]
+    fn typed_trainer_rejects_approximate_assignment_for_non_ivf_pq() {
+        let error = VectorIndexTrainer::new_with_approximate_assignment(
+            VectorIndexConfig::IvfFlat {
+                dimension: 8,
+                nlist: 4,
+                metric: MetricType::L2,
+            },
+            true,
+        )
+        .err()
+        .expect("IVF-Flat must reject approximate assignment");
+        assert!(error
+            .to_string()
+            .contains("approximate-assignment is only valid for IVF-PQ"));
     }
 
     #[test]
