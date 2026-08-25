@@ -17,7 +17,8 @@
 
 use crate::blas::sgemm_a_bt;
 use crate::distance::{
-    fvec_ip_batch, fvec_l2sqr_batch, fvec_norm_l2sqr, pq_distance_from_table, MetricType,
+    fvec_ip_batch, fvec_l2sqr, fvec_l2sqr_batch, fvec_norm_l2sqr, pq_distance_from_table,
+    MetricType,
 };
 use crate::kmeans::{self, KMeansConfig};
 use rayon::prelude::*;
@@ -390,10 +391,44 @@ impl ProductQuantizer {
     pub(crate) fn encode_batch_blocked(&self, data: &[f32], n: usize, codes: &mut [u8]) {
         // The 4-bit packed path keeps the original per-vector implementation.
         if self.nbits == 8 && (0..self.m).all(|sub| self.chunk_dim(sub) >= 4) {
+            if n < ENCODE_TRANSPOSE_MIN_ROWS {
+                self.encode_batch_8bit_direct(data, n, codes);
+                return;
+            }
             self.encode_batch_8bit_transposed(data, n, codes);
             return;
         }
         self.encode_batch(data, n, codes);
+    }
+
+    /// Stable direct-distance path for batches too small to amortize a full
+    /// codebook transpose.
+    fn encode_batch_8bit_direct(&self, data: &[f32], n: usize, codes: &mut [u8]) {
+        let d = self.d;
+        let cs = self.code_size();
+        codes[..n * cs]
+            .par_chunks_mut(cs)
+            .enumerate()
+            .for_each(|(i, code)| {
+                let row = &data[i * d..(i + 1) * d];
+                for (sub, dst) in code.iter_mut().enumerate() {
+                    let range = self.chunk_range(sub);
+                    let q = &row[range];
+                    let dsub = q.len();
+                    let base = self.centroid_chunk_base(sub);
+                    let mut best = 0;
+                    let mut best_dist = fvec_l2sqr(q, &self.centroids[base..base + dsub]);
+                    for j in 1..self.ksub {
+                        let offset = base + j * dsub;
+                        let dist = fvec_l2sqr(q, &self.centroids[offset..offset + dsub]);
+                        if dist < best_dist {
+                            best = j;
+                            best_dist = dist;
+                        }
+                    }
+                    *dst = best as u8;
+                }
+            });
     }
 
     /// Blocked transposed-codebook encode for nbits=8.
@@ -609,6 +644,9 @@ fn argmin_code(distances: &[f32]) -> u8 {
 /// per-thread score buffer at 1 KiB and yields ~20 blocks per thread at the
 /// production 32,768-row add batch.
 const MAX_ENCODE_BLOCK_ROWS: usize = 512;
+/// Below this row count the one-time codebook transpose is not worth it.
+const ENCODE_TRANSPOSE_MIN_ROWS: usize = 32;
+
 fn encode_block_rows(rows: usize, workers: usize) -> usize {
     rows.div_ceil(workers.max(1))
         .clamp(32, MAX_ENCODE_BLOCK_ROWS)
@@ -621,6 +659,8 @@ fn encode_block_rows(rows: usize, workers: usize) -> usize {
 /// `argmin_code`'s strictly-smaller update rule.
 #[inline]
 fn score_argmin(q: &[f32], t: &[f32], ksub: usize, scores: &mut [f32]) -> u8 {
+    assert_eq!(q.len().checked_mul(ksub), Some(t.len()));
+    assert!(scores.len() >= ksub);
     #[cfg(target_arch = "aarch64")]
     {
         if q.len() == 4 && ksub.is_multiple_of(4) {
@@ -1016,7 +1056,7 @@ mod tests {
         pq.centroids[0..4].fill(100_000_008.0);
         pq.centroids[4..8].fill(100_000_000.0);
 
-        for n in [1, 32] {
+        for n in [1, 31, 32] {
             let data = vec![100_000_000.0; n * pq.d];
             let mut codes = vec![0; n];
             pq.encode_batch_blocked(&data, n, &mut codes);
@@ -1070,6 +1110,13 @@ mod tests {
             score_argmin(&q, &t, ksub, &mut scores),
             argmin_code(&distances)
         );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_score_argmin_rejects_short_transposed_codebook() {
+        let mut scores = vec![0.0; 256];
+        score_argmin(&[0.0; 4], &[0.0; 4 * 256 - 1], 256, &mut scores);
     }
 
     #[test]

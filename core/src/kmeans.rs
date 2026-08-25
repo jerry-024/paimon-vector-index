@@ -37,7 +37,7 @@ fn assert_data_shape(data: &[f32], n: usize, d: usize) {
     assert_eq!(data.len(), expected, "data length does not match n * d");
 }
 
-fn assignment_block_plan(n: usize, d: usize, k: usize, threads: usize) -> (usize, bool) {
+pub(crate) fn assignment_block_plan(n: usize, d: usize, k: usize, threads: usize) -> (usize, bool) {
     let max_rows = (MAX_MATRIX_ELEMS / k.max(1)).max(1);
     if threads <= 1 {
         return (max_rows, false);
@@ -1123,6 +1123,11 @@ mod tests {
         assert!(!parallel);
         assert_eq!(rows, 131_072);
         assert!(rows * 2 * 16 <= MAX_MATRIX_ELEMS);
+
+        let (rows, parallel) = assignment_block_plan(100_000, 32, 4096, 32);
+        assert!(parallel);
+        assert_eq!(rows, 32);
+        assert!(rows * 4096 * 32 <= MAX_MATRIX_ELEMS);
     }
 
     #[test]
