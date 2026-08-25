@@ -39,6 +39,7 @@ pub mod kmeans;
 pub mod logging;
 pub mod opq;
 pub mod pq;
+pub mod projected_assign;
 pub mod read_options;
 pub mod rq;
 pub mod shuffler;

@@ -50,6 +50,7 @@ use crate::ivfsq_io::{
     search_batch_ivfsq_reader_filter_range, search_batch_ivfsq_reader_roaring_filter_range,
     write_ivfsq_index, IVFSQIndexReader, IVF_SQ_MAGIC,
 };
+use crate::projected_assign::ProjectedAssignment;
 pub use crate::read_options::{DeploymentProfile, VectorIndexReadPlan, VectorIndexReaderOptions};
 use crate::rq::{is_supported_rq_bits, padded_dimension, DEFAULT_RQ_BITS};
 use rand::rngs::StdRng;
@@ -1164,30 +1165,33 @@ pub struct VectorIndexTrainer {
 impl VectorIndexTrainer {
     pub fn from_options(options: &HashMap<String, String>) -> io::Result<Self> {
         let mut config_options = ConfigOptions::new(options)?;
-        let approximate_assignment = config_options
-            .optional("approximate-assignment")
-            .map(|value| parse_bool_option("approximate-assignment", &value))
+        let projected_assignment = config_options
+            .optional("projected-assignment")
+            .map(|value| parse_bool_option("projected-assignment", &value))
             .transpose()?;
-        config_options.values.remove("approximate-assignment");
+        config_options.values.remove("projected-assignment");
         let config = VectorIndexConfig::from_options(&config_options.values)?;
-        match approximate_assignment {
-            Some(enabled) => Self::new_with_approximate_assignment(config, enabled),
+        match projected_assignment {
+            Some(true) => Self::new_with_projected_assignment(config, ProjectedAssignment::Enabled),
+            Some(false) => {
+                Self::new_with_projected_assignment(config, ProjectedAssignment::Disabled)
+            }
             None => Self::new(config),
         }
     }
 
-    pub fn new_with_approximate_assignment(
+    pub fn new_with_projected_assignment(
         config: VectorIndexConfig,
-        enabled: bool,
+        mode: ProjectedAssignment,
     ) -> io::Result<Self> {
         if config.index_type() != IndexType::IvfPq {
             return Err(invalid_input(
-                "approximate-assignment is only valid for IVF-PQ",
+                "projected-assignment is only valid for IVF-PQ",
             ));
         }
         let mut trainer = Self::new(config)?;
         if let VectorIndexWriter::IvfPq(index) = &mut trainer.writer {
-            index.set_approximate_assignment(enabled);
+            index.set_projected_assignment(mode);
         }
         Ok(trainer)
     }
@@ -1385,7 +1389,7 @@ impl VectorIndexWriter {
         match self {
             Self::IvfFlat(index) => index.add(data, ids, n),
             Self::IvfSq(index) => index.add(data, ids, n),
-            Self::IvfPq(index) => return index.try_add(data, ids, n),
+            Self::IvfPq(index) => index.add(data, ids, n),
             Self::IvfRq(index) => index.add(data, ids, n),
             Self::DiskAnn(index) => index.add(data, ids),
         }
@@ -4175,7 +4179,7 @@ mod tests {
     }
 
     #[test]
-    fn ivf_pq_approximate_assignment_defaults_to_auto() {
+    fn ivf_pq_projected_assignment_option() {
         let auto = VectorIndexTrainer::from_options(&options(&[
             ("index.type", "ivf_pq"),
             ("dimension", "768"),
@@ -4186,50 +4190,55 @@ mod tests {
         let VectorIndexWriter::IvfPq(auto) = auto.writer else {
             panic!("expected IVF-PQ writer");
         };
-        assert!(auto.approximate_assignment);
+        assert_eq!(auto.projected_assignment, ProjectedAssignment::Auto);
 
-        let disabled = VectorIndexTrainer::from_options(&options(&[
-            ("index.type", "ivf_pq"),
-            ("dimension", "768"),
-            ("nlist", "4096"),
-            ("metric", "cosine"),
-            ("approximate-assignment", "false"),
-        ]))
-        .unwrap();
-        let VectorIndexWriter::IvfPq(disabled) = disabled.writer else {
-            panic!("expected IVF-PQ writer");
-        };
-        assert!(!disabled.approximate_assignment);
+        for (value, expected) in [
+            ("true", ProjectedAssignment::Enabled),
+            ("false", ProjectedAssignment::Disabled),
+        ] {
+            let trainer = VectorIndexTrainer::from_options(&options(&[
+                ("index.type", "ivf_pq"),
+                ("dimension", "768"),
+                ("nlist", "4096"),
+                ("metric", "cosine"),
+                ("projected-assignment", value),
+            ]))
+            .unwrap();
+            let VectorIndexWriter::IvfPq(index) = trainer.writer else {
+                panic!("expected IVF-PQ writer");
+            };
+            assert_eq!(index.projected_assignment, expected);
+        }
     }
 
     #[test]
-    fn config_from_options_rejects_approximate_assignment() {
+    fn config_from_options_rejects_projected_assignment() {
         let values = options(&[
             ("index.type", "ivf_pq"),
             ("dimension", "768"),
             ("nlist", "4096"),
             ("metric", "cosine"),
-            ("approximate-assignment", "false"),
+            ("projected-assignment", "false"),
         ]);
         let error = VectorIndexConfig::from_options(&values).unwrap_err();
         assert!(error.to_string().contains("unknown vector index option"));
     }
 
     #[test]
-    fn typed_trainer_rejects_approximate_assignment_for_non_ivf_pq() {
-        let error = VectorIndexTrainer::new_with_approximate_assignment(
+    fn typed_trainer_rejects_projected_assignment_for_non_ivf_pq() {
+        let error = VectorIndexTrainer::new_with_projected_assignment(
             VectorIndexConfig::IvfFlat {
                 dimension: 8,
                 nlist: 4,
                 metric: MetricType::L2,
             },
-            true,
+            ProjectedAssignment::Enabled,
         )
         .err()
-        .expect("IVF-Flat must reject approximate assignment");
+        .expect("IVF-Flat must reject projected assignment");
         assert!(error
             .to_string()
-            .contains("approximate-assignment is only valid for IVF-PQ"));
+            .contains("projected-assignment is only valid for IVF-PQ"));
     }
 
     #[test]

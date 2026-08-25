@@ -232,7 +232,7 @@ pub(crate) fn estimate_sharded_vamana_memory_bytes(
 }
 
 impl VamanaGraph {
-    pub(crate) fn search_scratch(&self, search_list_size: usize) -> GreedySearchScratch {
+    fn search_scratch(&self, search_list_size: usize) -> GreedySearchScratch {
         GreedySearchScratch::new(
             self.adjacency.len(),
             self.adjacency.max_degree,
@@ -729,25 +729,6 @@ impl VamanaGraph {
             &mut scratch,
         );
         scratch.results.into_sorted_vec()
-    }
-
-    pub(crate) fn greedy_search_best_with_scratch(
-        &self,
-        vectors: &[f32],
-        dimension: usize,
-        query: &[f32],
-        search_list_size: usize,
-        scratch: &mut GreedySearchScratch,
-    ) -> Option<ScoredNode> {
-        self.greedy_search_with_scratch(
-            vectors,
-            dimension,
-            MetricType::L2,
-            query,
-            search_list_size,
-            scratch,
-        );
-        scratch.results.iter().min().copied()
     }
 
     fn greedy_search_with_scratch(
@@ -1628,7 +1609,7 @@ enum BuildVisitStates {
     Sparse(SparseTable<u8>),
 }
 
-pub(crate) struct GreedySearchScratch {
+struct GreedySearchScratch {
     visit_states: BuildVisitStates,
     results: BinaryHeap<ScoredNode>,
     frontier: BinaryHeap<Reverse<ScoredNode>>,

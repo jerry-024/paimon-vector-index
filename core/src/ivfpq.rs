@@ -25,49 +25,15 @@ use crate::kmeans::{self, KMeansConfig};
 use crate::logging::{emit_log, LogLevel};
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
+use crate::projected_assign::{CoarseProjection, ProjectedAssignment};
 use crate::sparse_table::SparseTable;
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-
-/// Beam width for graph-based coarse assignment. Keep this at least as wide
-/// as the graph build search to avoid poor local minima.
-const APPROX_ASSIGN_SEARCH_LIST: usize = 15;
-const APPROX_ASSIGN_MEMORY_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
-/// Match Lance's automatic cutoff for graph-based centroid assignment.
-const APPROX_ASSIGN_MIN_CENTROID_VALUES: usize = 1_000_000;
-
-pub(crate) fn use_approximate_assignment(d: usize, nlist: usize) -> bool {
-    d.saturating_mul(nlist) >= APPROX_ASSIGN_MIN_CENTROID_VALUES
-}
-
-fn validate_assign_graph_memory_budget(
-    nlist: usize,
-    max_degree: usize,
-    search_list_size: usize,
-    workers: usize,
-    budget: usize,
-) -> io::Result<()> {
-    let estimated_peak =
-        crate::vamana::estimate_vamana_memory_bytes(nlist, max_degree, search_list_size, workers)
-            .map(|estimate| estimate.build_peak_bytes.max(estimate.remap_peak_bytes));
-    if estimated_peak.is_none_or(|peak| peak > budget) {
-        return Err(io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            format!(
-                "IVF-PQ approximate assignment graph requires {} bytes, exceeding the {budget} byte budget",
-                estimated_peak
-                    .map(|peak| peak.to_string())
-                    .unwrap_or_else(|| "an unrepresentable amount of memory".to_string())
-            ),
-        ));
-    }
-    Ok(())
-}
 
 pub trait RowIdFilter: Sync {
     fn contains(&self, id: i64) -> bool;
@@ -113,15 +79,12 @@ pub struct IVFPQIndex {
     precomputed_table: Vec<f32>,
     /// Block-layout packed codes for 4-bit FastScan. One per list.
     fastscan_codes: Vec<Vec<u8>>,
-    /// Build-only Vamana graph over the coarse centroids for approximate
-    /// assignment during `add`. Never serialized; built after training and
-    /// copied to writers created with [`Self::from_trained`].
-    /// IVF bucketing is a heuristic partition, so a near-tie neighbor bucket
-    /// (dist ratio ~1.01 in benchmarks) is as good as the exact argmin;
-    /// queries probe multiple buckets anyway.
-    assign_graph: Option<crate::vamana::VamanaGraph>,
-    pub(crate) approximate_assignment: bool,
-    approximate_assignment_explicit: bool,
+    /// Build-only PCA projection of the coarse centroids that lets `add`
+    /// find the exact nearest centroid with a lower-bound branch-and-bound
+    /// instead of a full scan. Derived from the centroids in `train`, shared
+    /// by `from_trained`, never serialized.
+    coarse_projection: Option<Arc<CoarseProjection>>,
+    pub(crate) projected_assignment: ProjectedAssignment,
 }
 
 impl IVFPQIndex {
@@ -158,23 +121,30 @@ impl IVFPQIndex {
             codes: vec![Vec::new(); nlist],
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
-            assign_graph: None,
-            approximate_assignment: use_approximate_assignment(d, nlist),
-            approximate_assignment_explicit: false,
+            coarse_projection: None,
+            projected_assignment: ProjectedAssignment::Auto,
         }
     }
 
-    pub fn with_approximate_assignment(mut self, enabled: bool) -> Self {
-        self.set_approximate_assignment(enabled);
+    pub fn with_projected_assignment(mut self, mode: ProjectedAssignment) -> Self {
+        self.set_projected_assignment(mode);
         self
     }
 
-    pub(crate) fn set_approximate_assignment(&mut self, enabled: bool) {
-        self.approximate_assignment = enabled;
-        self.approximate_assignment_explicit = true;
-        if !enabled {
-            self.assign_graph = None;
+    /// Choose how `add` finds the nearest coarse centroid. Takes effect on the
+    /// next `train`; on an already trained index the projection is rebuilt
+    /// (or dropped) immediately. Every mode yields the exact nearest centroid.
+    pub(crate) fn set_projected_assignment(&mut self, mode: ProjectedAssignment) {
+        self.projected_assignment = mode;
+        if !self.quantizer_centroids.is_empty() {
+            self.rebuild_coarse_projection();
+        } else {
+            self.coarse_projection = None;
         }
+    }
+
+    pub fn coarse_projection(&self) -> Option<&CoarseProjection> {
+        self.coarse_projection.as_deref()
     }
 
     /// Create an index with automatic nlist based on target partition size.
@@ -225,14 +195,13 @@ impl IVFPQIndex {
             codes: vec![Vec::new(); trained.nlist],
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
-            assign_graph: trained.assign_graph.clone(),
-            approximate_assignment: trained.approximate_assignment,
-            approximate_assignment_explicit: trained.approximate_assignment_explicit,
+            coarse_projection: trained.coarse_projection.clone(),
+            projected_assignment: trained.projected_assignment,
         }
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
-        self.assign_graph = None;
+        self.coarse_projection = None;
         let d = self.d;
 
         let train_data = if self.metric == MetricType::Cosine {
@@ -270,86 +239,42 @@ impl IVFPQIndex {
             effective_data
         };
         self.pq.train(&pq_train_data, n);
-        if let Err(error) = self.rebuild_assign_graph() {
-            // `train` is an infallible compatibility API. Explicit mode keeps
-            // the request enabled so the public `try_add` path can return the
-            // graph-build error instead of silently falling back to exact.
-            emit_log(
-                LogLevel::Warn,
-                &format!(
-                    "explicit IVF-PQ approximate assignment graph build failed during training; try_add will retry and return the error: {error}"
-                ),
-            );
-        }
+        self.rebuild_coarse_projection();
     }
 
-    /// Build the build-only centroid graph for approximate assignment.
-    fn rebuild_assign_graph(&mut self) -> io::Result<()> {
-        self.assign_graph = None;
-        if !self.approximate_assignment {
-            return Ok(());
-        }
-        let params = crate::diskann::DiskAnnBuildParams {
-            max_degree: 12,
-            build_search_list_size: APPROX_ASSIGN_SEARCH_LIST,
-            alpha: 1.2,
-            seed: 42,
-            memory_budget_bytes: APPROX_ASSIGN_MEMORY_BUDGET_BYTES,
-            storage_layout: crate::diskann::DiskAnnStorageLayout::Compact,
-            raw_vector_encoding: crate::diskann::DiskAnnRawVectorEncoding::F32,
-            build_distance: crate::diskann::DiskAnnBuildDistance::FullPrecision,
+    /// Fit the build-only centroid projection used by `add`. Auto mode keeps
+    /// it only when the centroids are compressible enough for the projected
+    /// branch-and-bound to beat the exact scan; the result is exact either way.
+    fn rebuild_coarse_projection(&mut self) {
+        self.coarse_projection = None;
+        let force = match self.projected_assignment {
+            ProjectedAssignment::Disabled => return,
+            ProjectedAssignment::Enabled => true,
+            ProjectedAssignment::Auto => false,
         };
-        if let Err(error) = validate_assign_graph_memory_budget(
-            self.nlist,
-            params.max_degree,
-            params.build_search_list_size,
-            rayon::current_num_threads(),
-            params.memory_budget_bytes,
-        ) {
-            if self.approximate_assignment_explicit {
-                return Err(error);
-            }
-            emit_log(
+        let projection =
+            CoarseProjection::train(&self.quantizer_centroids, self.nlist, self.d, force);
+        match &projection {
+            Some(p) => emit_log(
+                LogLevel::Info,
+                &format!(
+                    "IVF-PQ projected assignment enabled: d'={} of d={} ({:.1}% centroid variance)",
+                    p.dimension(),
+                    self.d,
+                    p.explained_variance() * 100.0
+                ),
+            ),
+            None if force => emit_log(
                 LogLevel::Warn,
-                &format!("automatic IVF-PQ approximate assignment disabled: {error}"),
-            );
-            self.approximate_assignment = false;
-            return Ok(());
+                "IVF-PQ projected assignment requested but the centroids admit no projection; using the exact scan",
+            ),
+            None => {}
         }
-        match crate::vamana::VamanaGraph::build(
-            &self.quantizer_centroids,
-            self.nlist,
-            self.d,
-            params,
-        ) {
-            Ok(graph) => self.assign_graph = Some(graph),
-            Err(error) if self.approximate_assignment_explicit => return Err(error),
-            Err(error) => {
-                emit_log(
-                    LogLevel::Warn,
-                    &format!(
-                        "automatic IVF-PQ approximate assignment disabled after graph build failed: {error}"
-                    ),
-                );
-                self.approximate_assignment = false;
-            }
-        }
-        Ok(())
+        self.coarse_projection = projection.map(Arc::new);
     }
 
     /// Add vectors in batches (Faiss-style: batch assign → batch residual → batch encode).
-    ///
-    /// # Panics
-    ///
-    /// Panics if explicit approximate assignment cannot build its centroid graph. Use
-    /// [`Self::try_add`] to handle that error.
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
-        self.try_add(data, ids, n)
-            .expect("explicit IVF-PQ approximate assignment graph build failed");
-    }
-
-    /// Add vectors, returning an error if explicit approximate assignment cannot build its graph.
-    pub fn try_add(&mut self, data: &[f32], ids: &[i64], n: usize) -> io::Result<()> {
         const BATCH_SIZE: usize = 32768;
         let mut offset = 0;
         while offset < n {
@@ -358,52 +283,21 @@ impl IVFPQIndex {
                 &data[offset * self.d..(offset + batch_n) * self.d],
                 &ids[offset..offset + batch_n],
                 batch_n,
-            )?;
+            );
             offset += batch_n;
         }
-        Ok(())
     }
 
-    fn add_batch(&mut self, data: &[f32], ids: &[i64], n: usize) -> io::Result<()> {
-        // A caller may explicitly enable approximate assignment after train().
-        // Build before assigning the first row so the result never depends on
-        // how the caller splits rows into add batches.
-        if self.approximate_assignment_explicit && self.assign_graph.is_none() {
-            self.rebuild_assign_graph()?;
-        }
+    fn add_batch(&mut self, data: &[f32], ids: &[i64], n: usize) {
         let d = self.d;
 
         // L2/IP without OPQ borrows the caller's batch instead of copying it.
         let processed = self.preprocess_queries(data, n);
-        let assignments = match &self.assign_graph {
-            // Approximate: beam search over the centroid graph. Same L2
-            // geometry as the exact path (cosine inputs are normalized by
-            // preprocess_queries, where L2 argmin == cosine argmax).
-            Some(graph) => {
-                let mut assignments = vec![0usize; n];
-                // Chunk so a production-sized batch (~2,730 rows) still fans
-                // out across every worker; 1 chunk per row would thrash.
-                let chunk = (n / (rayon::current_num_threads() * 4).max(1)).clamp(16, 1024);
-                assignments.par_chunks_mut(chunk).enumerate().for_each_init(
-                    || graph.search_scratch(APPROX_ASSIGN_SEARCH_LIST),
-                    |scratch, (chunk_idx, chunk_slice)| {
-                        let row0 = chunk_idx * chunk;
-                        for (i, slot) in chunk_slice.iter_mut().enumerate() {
-                            let q = &processed[(row0 + i) * d..(row0 + i + 1) * d];
-                            *slot = graph
-                                .greedy_search_best_with_scratch(
-                                    &self.quantizer_centroids,
-                                    d,
-                                    q,
-                                    APPROX_ASSIGN_SEARCH_LIST,
-                                    scratch,
-                                )
-                                .map(|s| s.id as usize)
-                                .unwrap_or(0);
-                        }
-                    },
-                );
-                assignments
+        // Both branches return the exact nearest centroid; the projection only
+        // prunes the scan (see `projected_assign`).
+        let assignments = match &self.coarse_projection {
+            Some(projection) => {
+                projection.assign(&processed, n, &self.quantizer_centroids, self.nlist)
             }
             None => {
                 kmeans::find_nearest_batch(&processed, n, &self.quantizer_centroids, self.nlist, d)
@@ -443,7 +337,6 @@ impl IVFPQIndex {
         if !self.precomputed_table.is_empty() {
             self.precomputed_table.clear();
         }
-        Ok(())
     }
 
     /// Build fastscan block codes for 4-bit search acceleration.
@@ -3154,163 +3047,202 @@ mod tests {
         data
     }
 
-    /// Small nlist keeps the assign graph disabled: behavior must be
-    /// identical to the exact path (assign_graph stays None).
-    #[test]
-    fn test_assign_graph_disabled_below_min_nlist() {
-        let d = 16;
-        let n = 500;
-        let data = generate_clustered_data(n, d, 4, 7);
-        let mut index = IVFPQIndex::new(d, 4, 4, MetricType::L2, false);
-        index.train(&data, n);
-        assert!(index.assign_graph.is_none());
-    }
-
-    #[test]
-    fn test_approximate_assignment_defaults_to_auto() {
-        assert!(!IVFPQIndex::new(16, 1024, 4, MetricType::L2, false).approximate_assignment);
-        assert!(IVFPQIndex::new(768, 4096, 192, MetricType::L2, false).approximate_assignment);
-        assert!(
-            !IVFPQIndex::new(768, 4096, 192, MetricType::L2, false)
-                .with_approximate_assignment(false)
-                .approximate_assignment
-        );
-    }
-
-    #[test]
-    fn test_assign_graph_memory_budget() {
-        assert!(validate_assign_graph_memory_budget(4096, 12, 15, 16, 1024 * 1024 * 1024).is_ok());
-        assert!(validate_assign_graph_memory_budget(4096, 12, 15, 16, 1).is_err());
-    }
-
-    #[test]
-    fn test_approximate_assignment_is_independent_of_add_batches() {
-        let d = 8;
-        let nlist = 16;
-        let train_n = 512;
-        let add_n = 97;
-        let train_data = generate_clustered_data(train_n, d, nlist, 17);
-        let add_data = generate_clustered_data(add_n, d, nlist, 18);
-        let ids: Vec<i64> = (0..add_n as i64).collect();
-        let mut trained = IVFPQIndex::new(d, nlist, 2, MetricType::L2, false);
-        // Exercise the automatic lifecycle without requiring a production-size
-        // dimension x nlist shape in this unit test.
-        trained.approximate_assignment = true;
-        trained.train(&train_data, train_n);
-        assert!(trained.assign_graph.is_some());
-
-        let mut one_batch = IVFPQIndex::from_trained(&trained);
-        assert!(one_batch.assign_graph.is_some());
-        one_batch.add(&add_data, &ids, add_n);
-
-        let mut split_batches = IVFPQIndex::from_trained(&trained);
-        for range in [0..1, 1..14, 14..47, 47..add_n] {
-            split_batches.add(
-                &add_data[range.start * d..range.end * d],
-                &ids[range.clone()],
-                range.len(),
-            );
+    /// Rows on a low-dimensional manifold with a little full-dimensional
+    /// noise: the shape real embeddings have and the projection is built for.
+    fn generate_low_rank_data(n: usize, d: usize, rank: usize, noise: f32, seed: u64) -> Vec<f32> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let factors: Vec<f32> = (0..rank * d).map(|_| rng.gen::<f32>() - 0.5).collect();
+        let mut data = vec![0.0f32; n * d];
+        for row in data.chunks_mut(d) {
+            let z: Vec<f32> = (0..rank).map(|_| rng.gen::<f32>() - 0.5).collect();
+            for (j, v) in row.iter_mut().enumerate() {
+                let mut acc = 0.0;
+                for t in 0..rank {
+                    acc += z[t] * factors[t * d + j];
+                }
+                *v = acc + (rng.gen::<f32>() - 0.5) * noise;
+            }
         }
-
-        assert_eq!(split_batches.ids, one_batch.ids);
-        assert_eq!(split_batches.codes, one_batch.codes);
+        data
     }
 
-    #[test]
-    fn test_disabling_approximate_assignment_clears_graph() {
-        let mut index =
-            IVFPQIndex::new(16, 1024, 4, MetricType::L2, false).with_approximate_assignment(true);
-        index.assign_graph = Some(crate::vamana::VamanaGraph::from_adjacency(0, vec![vec![]]));
-
-        index.set_approximate_assignment(false);
-
-        assert!(index.assign_graph.is_none());
-    }
-
-    #[test]
-    fn test_assign_graph_failure_only_disables_auto_mode() {
-        let mut auto = IVFPQIndex::new(1024, 1024, 16, MetricType::L2, false);
-        assert!(auto.rebuild_assign_graph().is_ok());
-        assert!(!auto.approximate_assignment);
-
-        let mut explicit =
-            IVFPQIndex::new(16, 1024, 4, MetricType::L2, false).with_approximate_assignment(true);
-        assert!(explicit.rebuild_assign_graph().is_err());
-        assert!(explicit.approximate_assignment);
-    }
-
-    #[test]
-    fn test_try_add_returns_explicit_assign_graph_failure() {
-        let mut index =
-            IVFPQIndex::new(16, 1024, 4, MetricType::L2, false).with_approximate_assignment(true);
-
-        assert!(index.try_add(&[0.0; 16], &[0], 1).is_err());
-    }
-
-    /// With nlist above the threshold and explicit opt-in, the graph is built, and approximate
-    /// assignment must bucket every vector into a near-tie list: the chosen
-    /// centroid's distance is within a small factor of the exact nearest.
-    #[test]
-    fn test_assign_graph_buckets_are_near_ties() {
-        let d = 16;
-        let nlist = 1024;
-        let n = 4000;
-        let data = generate_clustered_data(n, d, 64, 11);
-        let ids: Vec<i64> = (0..n as i64).collect();
-
-        assert!(
-            !IVFPQIndex::new(d, nlist, 4, MetricType::L2, false).approximate_assignment,
-            "exact assignment must remain the default"
-        );
-        let mut index =
-            IVFPQIndex::new(d, nlist, 4, MetricType::L2, false).with_approximate_assignment(true);
-        index.train(&data, n);
-        assert!(
-            index.assign_graph.is_some(),
-            "graph is built during training"
-        );
-        index.add(&data, &ids, n);
-        assert!(
-            index.assign_graph.is_some(),
-            "graph expected at nlist={nlist}"
-        );
-
-        // Recover each vector's bucket and compare against the exact argmin.
+    fn bucket_of(index: &IVFPQIndex, n: usize) -> Vec<usize> {
         let mut bucket_of = vec![usize::MAX; n];
         for (list_id, ids_in_list) in index.ids.iter().enumerate() {
             for &id in ids_in_list {
                 bucket_of[id as usize] = list_id;
             }
         }
-        let exact = kmeans::find_nearest_batch(&data, n, &index.quantizer_centroids, nlist, d);
-        let dist = |i: usize, c: usize| -> f32 {
-            let q = &data[i * d..(i + 1) * d];
-            let cent = &index.quantizer_centroids[c * d..(c + 1) * d];
-            q.iter()
-                .zip(cent.iter())
-                .map(|(a, b)| (a - b) * (a - b))
-                .sum()
-        };
+        bucket_of
+    }
+
+    /// Buckets must equal the exact scan, except where two centroids are an
+    /// f32 near-tie and either answer is the exact nearest up to rounding.
+    fn assert_buckets_match_exact(index: &IVFPQIndex, data: &[f32], n: usize) {
+        let d = index.d;
+        let buckets = bucket_of(index, n);
+        let exact = kmeans::find_nearest_batch(data, n, &index.quantizer_centroids, index.nlist, d);
         for i in 0..n {
-            assert_ne!(bucket_of[i], usize::MAX, "row {i} missing from lists");
-            let chosen = dist(i, bucket_of[i]).sqrt();
-            let best = dist(i, exact[i]).sqrt().max(1e-12);
+            assert_ne!(buckets[i], usize::MAX, "row {i} missing from lists");
+            if buckets[i] == exact[i] {
+                continue;
+            }
+            let q = &data[i * d..(i + 1) * d];
+            let chosen = crate::distance::fvec_l2sqr(
+                q,
+                &index.quantizer_centroids[buckets[i] * d..(buckets[i] + 1) * d],
+            );
+            let best = crate::distance::fvec_l2sqr(
+                q,
+                &index.quantizer_centroids[exact[i] * d..(exact[i] + 1) * d],
+            );
+            // The scan expands |x|² + |c|² - 2x·c in f32, so on offset data
+            // its own error is proportional to the norms, not the distance.
+            let norms = crate::distance::fvec_norm_l2sqr(q)
+                + crate::distance::fvec_norm_l2sqr(
+                    &index.quantizer_centroids[exact[i] * d..(exact[i] + 1) * d],
+                );
             assert!(
-                chosen / best < 1.10,
-                "row {i}: bucket {} at dist {chosen} vs nearest {} at {best} (ratio {})",
-                bucket_of[i],
-                exact[i],
-                chosen / best
+                (chosen - best).abs() <= 1e-5 * best.max(1e-12) + 1e-6 * norms,
+                "row {i}: bucket {} at {chosen} vs exact {} at {best}",
+                buckets[i],
+                exact[i]
             );
         }
+    }
 
+    #[test]
+    fn test_projected_assignment_defaults_to_auto_and_gates_on_structure() {
+        let d = 64;
+        let nlist = 256;
+        let n = 6000;
+        let structured = generate_low_rank_data(n, d, 8, 0.05, 21);
+        let mut index = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false);
+        assert_eq!(index.projected_assignment, ProjectedAssignment::Auto);
+        index.train(&structured, n);
+        let projection = index
+            .coarse_projection()
+            .expect("compressible centroids keep the projection");
+        assert!(projection.dimension() * 3 <= d);
+
+        // Full-rank clusters: nothing to compress, auto falls back to the scan.
+        let unstructured = generate_clustered_data(n, d, 128, 22);
+        let mut index = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false);
+        index.train(&unstructured, n);
+        assert!(index.coarse_projection().is_none());
+        // Explicit enable still works there, and stays exact.
+        index.set_projected_assignment(ProjectedAssignment::Enabled);
+        assert!(index.coarse_projection().is_some());
+        let ids: Vec<i64> = (0..n as i64).collect();
+        index.add(&unstructured, &ids, n);
+        assert_buckets_match_exact(&index, &unstructured, n);
+    }
+
+    #[test]
+    fn test_projected_assignment_matches_exact_scan() {
+        let d = 64;
+        let nlist = 256;
+        let n = 6000;
+        let data = generate_low_rank_data(n, d, 8, 0.2, 23);
+        let ids: Vec<i64> = (0..n as i64).collect();
+        for metric in [MetricType::L2, MetricType::InnerProduct, MetricType::Cosine] {
+            let mut index = IVFPQIndex::new(d, nlist, 8, metric, false)
+                .with_projected_assignment(ProjectedAssignment::Enabled);
+            index.train(&data, n);
+            assert!(index.coarse_projection().is_some());
+            index.add(&data, &ids, n);
+            let processed = index.preprocess_queries(&data, n);
+            assert_buckets_match_exact(&index, &processed, n);
+        }
+    }
+
+    #[test]
+    fn test_projected_assignment_with_opq_matches_exact_scan() {
+        let d = 32;
+        let nlist = 128;
+        let n = 4000;
+        let data = generate_low_rank_data(n, d, 6, 0.2, 24);
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let mut index = IVFPQIndex::new(d, nlist, 8, MetricType::L2, true)
+            .with_projected_assignment(ProjectedAssignment::Enabled);
         index.train(&data, n);
-        assert!(
-            index.assign_graph.is_some(),
-            "retraining rebuilds the graph for the new centroids"
-        );
-        index.add(&data[..d], &[n as i64], 1);
-        assert!(index.assign_graph.is_some());
+        index.add(&data, &ids, n);
+        let processed = index.preprocess_queries(&data, n);
+        assert_buckets_match_exact(&index, &processed, n);
+    }
+
+    /// The projection is fixed at train time, so the index bytes cannot
+    /// depend on how the caller batches `add`.
+    #[test]
+    fn test_projected_assignment_is_batch_invariant() {
+        let d = 64;
+        let nlist = 256;
+        let n = 6000;
+        let data = generate_low_rank_data(n, d, 8, 0.2, 25);
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let mut trained = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false)
+            .with_projected_assignment(ProjectedAssignment::Enabled);
+        trained.train(&data, n);
+
+        let mut whole = IVFPQIndex::from_trained(&trained);
+        whole.add(&data, &ids, n);
+        let mut split = IVFPQIndex::from_trained(&trained);
+        let mut offset = 0;
+        for chunk in [1usize, 999, 2000, 3000] {
+            split.add(
+                &data[offset * d..(offset + chunk) * d],
+                &ids[offset..offset + chunk],
+                chunk,
+            );
+            offset += chunk;
+        }
+        assert_eq!(offset, n);
+        assert_eq!(whole.ids, split.ids);
+        assert_eq!(whole.codes, split.codes);
+    }
+
+    #[test]
+    fn test_from_trained_shares_projection_and_retrain_rebuilds_it() {
+        let d = 64;
+        let nlist = 256;
+        let n = 6000;
+        let data = generate_low_rank_data(n, d, 8, 0.05, 26);
+        let mut trained = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false);
+        trained.train(&data, n);
+        let projection = trained.coarse_projection.clone().expect("projection");
+
+        let worker = IVFPQIndex::from_trained(&trained);
+        assert!(Arc::ptr_eq(
+            &projection,
+            worker.coarse_projection.as_ref().unwrap()
+        ));
+
+        trained.train(&data, n);
+        let rebuilt = trained
+            .coarse_projection
+            .clone()
+            .expect("projection after retrain");
+        assert!(!Arc::ptr_eq(&projection, &rebuilt));
+
+        trained.set_projected_assignment(ProjectedAssignment::Disabled);
+        assert!(trained.coarse_projection().is_none());
+        let ids: Vec<i64> = (0..n as i64).collect();
+        trained.add(&data, &ids, n);
+        assert_buckets_match_exact(&trained, &data, n);
+    }
+
+    #[test]
+    fn test_projected_assignment_forced_on_tiny_index_stays_exact() {
+        let d = 16;
+        let nlist = 4;
+        let n = 500;
+        let data = generate_clustered_data(n, d, 4, 27);
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let mut index = IVFPQIndex::new(d, nlist, 4, MetricType::L2, false)
+            .with_projected_assignment(ProjectedAssignment::Enabled);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        assert_buckets_match_exact(&index, &data, n);
     }
 
     fn observed_ephemeral_precomputed_lists(
