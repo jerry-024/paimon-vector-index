@@ -63,6 +63,48 @@ pub fn sgemm_a_bt(
     }
 }
 
+/// f64 variant of [`sgemm_a_bt`]: C = alpha * A * B^T + beta * C.
+pub fn dgemm_a_bt(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f64,
+    a: &[f64],
+    b: &[f64],
+    beta: f64,
+    c: &mut [f64],
+) {
+    assert!(
+        k <= isize::MAX as usize && n <= isize::MAX as usize,
+        "DGEMM dimensions exceed isize"
+    );
+    let a_len = m.checked_mul(k).expect("a shape overflows usize");
+    let b_len = n.checked_mul(k).expect("b shape overflows usize");
+    let c_len = m.checked_mul(n).expect("c shape overflows usize");
+    assert!(a.len() >= a_len, "a is shorter than m * k");
+    assert!(b.len() >= b_len, "b is shorter than n * k");
+    assert!(c.len() >= c_len, "c is shorter than m * n");
+
+    unsafe {
+        matrixmultiply::dgemm(
+            m,
+            k,
+            n,
+            alpha,
+            a.as_ptr(),
+            k as isize,
+            1,
+            b.as_ptr(),
+            1,
+            k as isize,
+            beta,
+            c.as_mut_ptr(),
+            n as isize,
+            1,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

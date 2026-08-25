@@ -24,7 +24,10 @@
 //! 1. project the row and centroids with a contractive PCA projection `P`
 //!    (`d' × d`);
 //! 2. for every centroid compute a conservative lower bound on the true
-//!    squared distance, accounting for the f32 projection and GEMM errors;
+//!    squared distance: the projected distance plus the reverse triangle
+//!    inequality on the components outside the subspace
+//!    (`|x-c|² >= |P₀(x-c)|² + (|P₀⊥x| - |P₀⊥c|)²`), with every f32
+//!    projection, GEMM and f64 rounding error accounted for explicitly;
 //! 3. evaluate exact distances in ascending bound order and stop as soon as
 //!    the next bound cannot beat the best exact distance (branch-and-bound).
 //!
@@ -42,7 +45,7 @@
 //! The projection is a training artifact: it is derived deterministically from
 //! the centroids, shared by `IVFPQIndex::from_trained`, and never serialized.
 
-use crate::blas::sgemm_a_bt;
+use crate::blas::{dgemm_a_bt, sgemm_a_bt};
 use crate::distance::{fvec_l2sqr, fvec_l2sqr_four};
 use nalgebra::{DMatrix, SymmetricEigen};
 use rand::rngs::StdRng;
@@ -100,8 +103,14 @@ pub struct CoarseProjection {
     d: usize,
     dp: usize,
     explained_variance: f64,
-    /// `dp × d`, scaled so its operator norm does not exceed one.
-    proj: Vec<f32>,
+    /// Centroid mean (f64), subtracted before projecting rows and centroids.
+    /// Translation cancels in the projected term but not in the residual
+    /// term, whose norms must not be dominated by a common offset.
+    mean: Vec<f64>,
+    /// `dp × d`, scaled so its operator norm does not exceed one. Stored in
+    /// f64 (exactly the f32 values used for the singular-value bounds) so the
+    /// row projection carries only f64 rounding.
+    proj: Vec<f64>,
     /// `nlist × dp`: projected centroids.
     cents_p: Vec<f32>,
     /// `|cents_p[c]|²`.
@@ -110,6 +119,15 @@ pub struct CoarseProjection {
     cents_p_norms_sqrt: Vec<f64>,
     /// Upper bound on the f32 GEMM error in each projected centroid.
     cents_p_errors: Vec<f64>,
+    /// Bounds on the squared singular values of `proj`: `|P v|² / sigma_max_sq
+    /// <= |P₀ v|² <= |P v|² / sigma_min_sq` for the orthonormal basis `P₀` of
+    /// its row space. `sigma_min_sq == 0` disables the residual term.
+    sigma_min_sq: f64,
+    sigma_max_sq: f64,
+    /// Interval for `|P₀⊥ c|`, the norm of each centroid's component outside
+    /// the projected subspace, including every rounding error above.
+    cents_res_lo: Vec<f64>,
+    cents_res_hi: Vec<f64>,
 }
 
 impl CoarseProjection {
@@ -273,29 +291,57 @@ impl CoarseProjection {
         dp: usize,
         explained_variance: f64,
     ) -> Self {
-        let mut proj = basis[..dp * d].to_vec();
-        make_contractive(&mut proj, dp, d);
-        let mut cents_p = vec![0.0f32; nlist * dp];
-        // Project uncentered vectors. Translation cancels in x-c, while this
-        // avoids a second source of f32 rounding in the lower bound.
-        sgemm_a_bt(nlist, dp, d, 1.0, cents, &proj, 0.0, &mut cents_p);
+        let mut proj_f32 = basis[..dp * d].to_vec();
+        make_contractive(&mut proj_f32, dp, d);
+        let (sigma_min_sq, sigma_max_sq) = singular_value_bounds(&proj_f32, dp, d);
+        let proj: Vec<f64> = proj_f32.iter().map(|v| *v as f64).collect();
+        let mean: Vec<f64> = column_mean(cents, nlist, d)
+            .iter()
+            .map(|v| *v as f64)
+            .collect();
+        // Center and project in f64, then round to f32 for the row×centroid
+        // GEMM. `cent_norms` are `|c - mean|²` in f64.
+        let (cents_p, cent_norms) = project_rows(cents, nlist, d, &proj, dp, &mean);
         let cents_p_norms: Vec<f64> = (0..nlist)
             .map(|c| norm_l2sqr_f64(&cents_p[c * dp..(c + 1) * dp]))
             .collect();
-        let cents_p_norms_sqrt = cents_p_norms.iter().map(|norm| norm.sqrt()).collect();
-        let cents_p_errors: Vec<f64> = cents
-            .chunks_exact(d)
-            .map(|c| projection_error(norm_upper(c), d, dp))
+        let cents_p_norms_sqrt: Vec<f64> = cents_p_norms.iter().map(|norm| norm.sqrt()).collect();
+        let cents_p_errors: Vec<f64> = (0..nlist)
+            .map(|c| {
+                projection_error(
+                    centered_norm_upper(cent_norms[c], d),
+                    cents_p_norms_sqrt[c],
+                    d,
+                    dp,
+                )
+            })
             .collect();
+        let (cents_res_lo, cents_res_hi): (Vec<f64>, Vec<f64>) = (0..nlist)
+            .map(|c| {
+                residual_interval(
+                    cent_norms[c],
+                    d,
+                    cents_p_norms[c],
+                    cents_p_errors[c],
+                    sigma_min_sq,
+                    sigma_max_sq,
+                )
+            })
+            .unzip();
         Self {
             d,
             dp,
             explained_variance,
+            mean,
             proj,
             cents_p,
             cents_p_norms,
             cents_p_norms_sqrt,
             cents_p_errors,
+            sigma_min_sq,
+            sigma_max_sq,
+            cents_res_lo,
+            cents_res_hi,
         }
     }
 
@@ -338,8 +384,7 @@ impl CoarseProjection {
                 let rows = chunk.len();
                 let row0 = bi * block_rows;
                 let x = &data[row0 * d..(row0 + rows) * d];
-                let mut xp = vec![0.0f32; rows * dp];
-                sgemm_a_bt(rows, dp, d, 1.0, x, &self.proj, 0.0, &mut xp);
+                let (xp, x_norms) = project_rows(x, rows, d, &self.proj, dp, &self.mean);
                 let mut ip = vec![0.0f32; rows * nlist];
                 sgemm_a_bt(rows, nlist, dp, 1.0, &xp, &self.cents_p, 0.0, &mut ip);
 
@@ -351,9 +396,24 @@ impl CoarseProjection {
                     let xn = norm_l2sqr_f64(xp_i);
                     let xn_sqrt = xn.sqrt();
                     let x_i = &x[i * d..(i + 1) * d];
-                    let x_error = projection_error(norm_upper(x_i), d, dp);
+                    let x_error =
+                        projection_error(centered_norm_upper(x_norms[i], d), xn_sqrt, d, dp);
+                    let (x_res_lo, x_res_hi) = residual_interval(
+                        x_norms[i],
+                        d,
+                        xn,
+                        x_error,
+                        self.sigma_min_sq,
+                        self.sigma_max_sq,
+                    );
                     let ip_i = &ip[i * nlist..(i + 1) * nlist];
                     for c in 0..nlist {
+                        // Reverse triangle inequality on the components outside
+                        // the subspace: |P₀⊥(x-c)| >= | |P₀⊥x| - |P₀⊥c| |, taken
+                        // at the worst case of both intervals.
+                        let residual = (x_res_lo - self.cents_res_hi[c])
+                            .max(self.cents_res_lo[c] - x_res_hi)
+                            .max(0.0);
                         bounds[c] = projected_distance_lower_bound(
                             xn,
                             xn_sqrt,
@@ -363,7 +423,7 @@ impl CoarseProjection {
                             x_error + self.cents_p_errors[c],
                             gemm_error_factor,
                             f64_error_factor,
-                        );
+                        ) + residual * residual;
                     }
                     let min_bound = bounds.iter().copied().fold(f64::INFINITY, f64::min);
                     let first = bounds.iter().position(|&b| b == min_bound).unwrap_or(0);
@@ -423,21 +483,32 @@ impl CoarseProjection {
     fn lower_bound(&self, x: &[f32], c: usize) -> f64 {
         let d = self.d;
         let dp = self.dp;
-        let mut xp = vec![0.0f32; dp];
-        sgemm_a_bt(1, dp, d, 1.0, x, &self.proj, 0.0, &mut xp);
+        let (xp, x_norms) = project_rows(x, 1, d, &self.proj, dp, &self.mean);
         let cp = &self.cents_p[c * dp..(c + 1) * dp];
         let ip = xp.iter().zip(cp).map(|(a, b)| a * b).sum();
         let x_norm = norm_l2sqr_f64(&xp);
+        let x_error = projection_error(centered_norm_upper(x_norms[0], d), x_norm.sqrt(), d, dp);
+        let (x_res_lo, x_res_hi) = residual_interval(
+            x_norms[0],
+            d,
+            x_norm,
+            x_error,
+            self.sigma_min_sq,
+            self.sigma_max_sq,
+        );
+        let residual = (x_res_lo - self.cents_res_hi[c])
+            .max(self.cents_res_lo[c] - x_res_hi)
+            .max(0.0);
         projected_distance_lower_bound(
             x_norm,
             x_norm.sqrt(),
             self.cents_p_norms[c],
             self.cents_p_norms_sqrt[c],
             ip,
-            projection_error(norm_upper(x), d, dp) + self.cents_p_errors[c],
+            x_error + self.cents_p_errors[c],
             2.0 * gamma_f32(dp.saturating_mul(2).saturating_add(1)),
             gamma_f64(dp.saturating_mul(2).saturating_add(8)),
-        )
+        ) + residual * residual
     }
 }
 
@@ -462,18 +533,52 @@ fn norm_l2sqr_f64(v: &[f32]) -> f64 {
     v.iter().map(|x| (*x as f64) * (*x as f64)).sum()
 }
 
-fn norm_upper(v: &[f32]) -> f64 {
-    let norm = norm_l2sqr_f64(v);
-    let error = gamma_f64(v.len().saturating_mul(2));
+/// Rows of `data` (`rows × d`, f32) centered by `mean`, projected with `proj`
+/// (`dp × d`, f64) in f64 and rounded to f32, plus `|row - mean|²` in f64 for
+/// each row. Row `i` of the projection is `P·(data[i] - mean)` up to the f64
+/// dot-product error plus half an ulp per component.
+fn project_rows(
+    data: &[f32],
+    rows: usize,
+    d: usize,
+    proj: &[f64],
+    dp: usize,
+    mean: &[f64],
+) -> (Vec<f32>, Vec<f64>) {
+    let mut centered = vec![0.0f64; rows * d];
+    let mut norms = vec![0.0f64; rows];
+    for (i, row) in data[..rows * d].chunks_exact(d).enumerate() {
+        let mut norm = 0.0;
+        for (j, v) in row.iter().enumerate() {
+            let c = *v as f64 - mean[j];
+            centered[i * d + j] = c;
+            norm += c * c;
+        }
+        norms[i] = norm;
+    }
+    let mut out = vec![0.0f64; rows * dp];
+    dgemm_a_bt(rows, dp, d, 1.0, &centered, proj, 0.0, &mut out);
+    (out.iter().map(|v| *v as f32).collect(), norms)
+}
+
+/// Upper bound on the norm of a centered vector from its f64 squared norm
+/// (`d` subtractions, squares and additions of f64 rounding).
+fn centered_norm_upper(norm_sq: f64, d: usize) -> f64 {
+    let error = gamma_f64(d.saturating_mul(3).saturating_add(1));
     if error >= 1.0 {
         f64::INFINITY
     } else {
-        (norm / (1.0 - error)).sqrt()
+        (norm_sq / (1.0 - error)).sqrt()
     }
 }
 
-fn projection_error(norm: f64, d: usize, dp: usize) -> f64 {
-    (dp as f64).sqrt() * gamma_f32(d.saturating_mul(2).saturating_add(1)) * norm
+/// Upper bound on `|P v - (P v)ᶜᵒᵐᵖ|` for a vector of norm at most `norm`
+/// whose projection (norm `proj_norm`) was computed by `project_rows`: the f64
+/// dot-product rounding over `d` terms in each of `dp` components, plus the
+/// final rounding to f32.
+fn projection_error(norm: f64, proj_norm: f64, d: usize, dp: usize) -> f64 {
+    (dp as f64).sqrt() * gamma_f64(d.saturating_mul(2).saturating_add(1)) * norm
+        + (f32::EPSILON as f64 / 2.0) * proj_norm
 }
 
 fn projected_distance_lower_bound(
@@ -511,6 +616,84 @@ fn distance_upper_bound(distance: f32, d: usize) -> f64 {
         return f64::INFINITY;
     }
     distance as f64 / (1.0 - relative_error) + d as f64 * f32::MIN_POSITIVE as f64
+}
+
+/// Conservative `[sigma_min², sigma_max²]` of the `rows × d` matrix `proj`
+/// from the eigenvalues of its Gram matrix, widened by the f64 rounding of
+/// the Gram entries (Gershgorin) and a relative margin for the eigensolver.
+/// Returns `(0, sigma_max²)` when the rows are numerically dependent.
+fn singular_value_bounds(proj: &[f32], rows: usize, d: usize) -> (f64, f64) {
+    if rows == 0 {
+        return (0.0, 0.0);
+    }
+    let dot_roundoff = gamma_f64(d.saturating_mul(2).saturating_add(1));
+    let mut gram = DMatrix::zeros(rows, rows);
+    let mut max_entry_error = 0.0f64;
+    for i in 0..rows {
+        let mut row_error = 0.0;
+        for j in 0..rows {
+            let mut dot = 0.0;
+            let mut absolute_sum = 0.0;
+            for (a, b) in proj[i * d..(i + 1) * d]
+                .iter()
+                .zip(&proj[j * d..(j + 1) * d])
+            {
+                let product = (*a as f64) * (*b as f64);
+                dot += product;
+                absolute_sum += product.abs();
+            }
+            gram[(i, j)] = dot;
+            row_error += dot_roundoff * absolute_sum;
+        }
+        max_entry_error = max_entry_error.max(row_error);
+    }
+    let eigen = SymmetricEigen::new(gram);
+    let lambda_max = eigen.eigenvalues.iter().cloned().fold(0.0f64, f64::max);
+    let lambda_min = eigen
+        .eigenvalues
+        .iter()
+        .cloned()
+        .fold(f64::INFINITY, f64::min);
+    let solver_margin = lambda_max * 1e-9 + max_entry_error;
+    let sigma_max_sq = lambda_max + solver_margin;
+    let sigma_min_sq = lambda_min - solver_margin;
+    if sigma_min_sq.is_nan() || sigma_min_sq <= 0.0 || !sigma_max_sq.is_finite() {
+        (0.0, sigma_max_sq.max(0.0))
+    } else {
+        (sigma_min_sq, sigma_max_sq)
+    }
+}
+
+/// Interval for `|P₀⊥ v|` given `|v|²` of the centered vector in f64 (`d`
+/// components), `|P v|²` as computed in f32 (`proj_norm_sq`, in f64), a bound
+/// `proj_error` on `|P v - (P v)ᶜᵒᵐᵖ|`,
+/// and the singular-value bounds of `P`. Every rounding error widens the
+/// interval; `sigma_min_sq == 0` yields `[0, |v|]`, i.e. no residual term.
+fn residual_interval(
+    full_norm_sq: f64,
+    d: usize,
+    proj_norm_sq: f64,
+    proj_error: f64,
+    sigma_min_sq: f64,
+    sigma_max_sq: f64,
+) -> (f64, f64) {
+    let full_hi = centered_norm_upper(full_norm_sq, d);
+    let full_hi_sq = full_hi * full_hi;
+    let full_lo_sq = full_norm_sq / (1.0 + gamma_f64(d.saturating_mul(3).saturating_add(1)));
+    let proj_norm = proj_norm_sq.max(0.0).sqrt();
+    let proj_hi = proj_norm + proj_error;
+    let proj_lo = (proj_norm - proj_error).max(0.0);
+    let hi_sq = if sigma_max_sq > 0.0 {
+        (full_hi_sq - proj_lo * proj_lo / sigma_max_sq).max(0.0)
+    } else {
+        full_hi_sq
+    };
+    let lo_sq = if sigma_min_sq > 0.0 {
+        (full_lo_sq - proj_hi * proj_hi / sigma_min_sq).max(0.0)
+    } else {
+        0.0
+    };
+    (lo_sq.sqrt(), hi_sq.sqrt().max(lo_sq.sqrt()))
 }
 
 fn make_contractive(proj: &mut [f32], rows: usize, d: usize) {
@@ -776,7 +959,7 @@ mod tests {
                 let dot: f64 = p.proj[a * d..(a + 1) * d]
                     .iter()
                     .zip(&p.proj[b * d..(b + 1) * d])
-                    .map(|(x, y)| (*x as f64) * (*y as f64))
+                    .map(|(x, y)| *x * *y)
                     .sum();
                 row_sum += dot.abs();
             }
