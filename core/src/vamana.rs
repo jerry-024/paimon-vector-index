@@ -232,14 +232,6 @@ pub(crate) fn estimate_sharded_vamana_memory_bytes(
 }
 
 impl VamanaGraph {
-    fn search_scratch(&self, search_list_size: usize) -> GreedySearchScratch {
-        GreedySearchScratch::new(
-            self.adjacency.len(),
-            self.adjacency.max_degree,
-            search_list_size.min(self.adjacency.len()),
-        )
-    }
-
     pub fn from_adjacency(entry_node: u32, adjacency: Vec<Vec<u32>>) -> Self {
         let max_degree = adjacency.iter().map(Vec::len).max().unwrap_or(0);
         Self {
@@ -719,7 +711,11 @@ impl VamanaGraph {
         query: &[f32],
         search_list_size: usize,
     ) -> Vec<ScoredNode> {
-        let mut scratch = self.search_scratch(search_list_size);
+        let mut scratch = GreedySearchScratch::new(
+            self.adjacency.len(),
+            self.adjacency.max_degree,
+            search_list_size.min(self.adjacency.len()),
+        );
         self.greedy_search_with_scratch(
             vectors,
             dimension,

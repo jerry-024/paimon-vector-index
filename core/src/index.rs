@@ -419,30 +419,27 @@ impl VectorIndexBuildPlan {
                 nlist: parse_nlist_options(&mut options, expected_vector_count)?,
                 metric,
             },
-            IndexType::IvfPq => {
-                let nlist = parse_nlist_options(&mut options, expected_vector_count)?;
-                VectorIndexConfig::IvfPq {
+            IndexType::IvfPq => VectorIndexConfig::IvfPq {
+                dimension,
+                nlist: parse_nlist_options(&mut options, expected_vector_count)?,
+                m: parse_pq_m_options(
+                    &mut options,
                     dimension,
-                    nlist,
-                    m: parse_pq_m_options(
-                        &mut options,
-                        dimension,
-                        8,
-                        true,
-                        max_bytes_per_vector
-                            .map(|bytes| persisted_code_budget(bytes, "IVF-PQ"))
-                            .transpose()?,
-                    )?,
-                    metric,
-                    use_opq: match options.optional("use-opq") {
-                        Some(use_opq) if use_opq.trim() == "auto" => {
-                            target_recall.is_some_and(|recall| recall >= 0.9)
-                        }
-                        Some(use_opq) => parse_bool_option("use-opq", &use_opq)?,
-                        None => target_recall.is_some_and(|recall| recall >= 0.9),
-                    },
-                }
-            }
+                    8,
+                    true,
+                    max_bytes_per_vector
+                        .map(|bytes| persisted_code_budget(bytes, "IVF-PQ"))
+                        .transpose()?,
+                )?,
+                metric,
+                use_opq: match options.optional("use-opq") {
+                    Some(use_opq) if use_opq.trim() == "auto" => {
+                        target_recall.is_some_and(|recall| recall >= 0.9)
+                    }
+                    Some(use_opq) => parse_bool_option("use-opq", &use_opq)?,
+                    None => target_recall.is_some_and(|recall| recall >= 0.9),
+                },
+            },
             IndexType::IvfRq => {
                 let explicit_bits = options
                     .optional("rq.bits")
@@ -1171,27 +1168,20 @@ impl VectorIndexTrainer {
             .transpose()?;
         config_options.values.remove("projected-assignment");
         let config = VectorIndexConfig::from_options(&config_options.values)?;
-        match projected_assignment {
-            Some(true) => Self::new_with_projected_assignment(config, ProjectedAssignment::Enabled),
-            Some(false) => {
-                Self::new_with_projected_assignment(config, ProjectedAssignment::Disabled)
-            }
-            None => Self::new(config),
-        }
-    }
-
-    pub fn new_with_projected_assignment(
-        config: VectorIndexConfig,
-        mode: ProjectedAssignment,
-    ) -> io::Result<Self> {
-        if config.index_type() != IndexType::IvfPq {
+        if projected_assignment.is_some() && config.index_type() != IndexType::IvfPq {
             return Err(invalid_input(
                 "projected-assignment is only valid for IVF-PQ",
             ));
         }
         let mut trainer = Self::new(config)?;
-        if let VectorIndexWriter::IvfPq(index) = &mut trainer.writer {
-            index.set_projected_assignment(mode);
+        if let (Some(enabled), VectorIndexWriter::IvfPq(index)) =
+            (projected_assignment, &mut trainer.writer)
+        {
+            index.set_projected_assignment(if enabled {
+                ProjectedAssignment::Enabled
+            } else {
+                ProjectedAssignment::Disabled
+            });
         }
         Ok(trainer)
     }
@@ -4225,15 +4215,14 @@ mod tests {
     }
 
     #[test]
-    fn typed_trainer_rejects_projected_assignment_for_non_ivf_pq() {
-        let error = VectorIndexTrainer::new_with_projected_assignment(
-            VectorIndexConfig::IvfFlat {
-                dimension: 8,
-                nlist: 4,
-                metric: MetricType::L2,
-            },
-            ProjectedAssignment::Enabled,
-        )
+    fn trainer_rejects_projected_assignment_for_non_ivf_pq() {
+        let error = VectorIndexTrainer::from_options(&options(&[
+            ("index.type", "ivf_flat"),
+            ("dimension", "8"),
+            ("nlist", "4"),
+            ("metric", "l2"),
+            ("projected-assignment", "true"),
+        ]))
         .err()
         .expect("IVF-Flat must reject projected assignment");
         assert!(error
