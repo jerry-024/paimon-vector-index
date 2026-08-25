@@ -437,10 +437,11 @@ impl CoarseProjection {
                             candidates.push((bound, c as u32));
                         }
                     }
-                    // Evaluate in stages of the `STAGE` smallest bounds: the
-                    // best distance usually drops within the first few exact
-                    // checks, which prunes the rest without sorting them.
+                    // Evaluate in small stages while pruning is effective. If
+                    // more than two stages survive the first one, sort the
+                    // remainder once to avoid quadratic repeated partitioning.
                     let mut pending = candidates.as_mut_slice();
+                    let mut first_stage = true;
                     while !pending.is_empty() {
                         let stage = STAGE.min(pending.len());
                         if stage < pending.len() {
@@ -469,6 +470,20 @@ impl CoarseProjection {
                             }
                         }
                         pending = &mut tail[..kept];
+                        if first_stage && pending.len() > 2 * STAGE {
+                            pending.sort_unstable_by(compare_bound_then_index);
+                            evaluations += evaluate_candidates(
+                                x_i,
+                                cents,
+                                d,
+                                pending,
+                                &mut best,
+                                &mut best_idx,
+                                &mut best_upper,
+                            );
+                            break;
+                        }
+                        first_stage = false;
                     }
                     chunk[i] = best_idx;
                 }
