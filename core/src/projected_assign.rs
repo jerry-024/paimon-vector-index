@@ -86,6 +86,8 @@ pub struct CoarseProjection {
     cents_p: Vec<f32>,
     /// `|cents_p[c]|²`.
     cents_p_norms: Vec<f64>,
+    /// `|cents_p[c]|`, cached to keep square roots out of assignment's hot loop.
+    cents_p_norms_sqrt: Vec<f64>,
     /// Upper bound on the f32 GEMM error in each projected centroid.
     cents_p_errors: Vec<f64>,
 }
@@ -160,6 +162,7 @@ impl CoarseProjection {
         let cents_p_norms: Vec<f64> = (0..nlist)
             .map(|c| norm_l2sqr_f64(&cents_p[c * dp..(c + 1) * dp]))
             .collect();
+        let cents_p_norms_sqrt = cents_p_norms.iter().map(|norm| norm.sqrt()).collect();
         let cents_p_errors: Vec<f64> = cents
             .chunks_exact(d)
             .map(|c| projection_error(norm_upper(c), d, dp))
@@ -171,6 +174,7 @@ impl CoarseProjection {
             proj,
             cents_p,
             cents_p_norms,
+            cents_p_norms_sqrt,
             cents_p_errors,
         })
     }
@@ -200,6 +204,8 @@ impl CoarseProjection {
     ) -> (Vec<usize>, usize) {
         let d = self.d;
         let dp = self.dp;
+        let gemm_error_factor = 2.0 * gamma_f32(dp.saturating_mul(2).saturating_add(1));
+        let f64_error_factor = gamma_f64(dp.saturating_mul(2).saturating_add(8));
         debug_assert_eq!(self.cents_p.len(), nlist * dp);
         let mut out = vec![0usize; n];
         let (block_rows, _) =
@@ -223,6 +229,7 @@ impl CoarseProjection {
                 for i in 0..rows {
                     let xp_i = &xp[i * dp..(i + 1) * dp];
                     let xn = norm_l2sqr_f64(xp_i);
+                    let xn_sqrt = xn.sqrt();
                     let x_i = &x[i * d..(i + 1) * d];
                     let x_error = projection_error(norm_upper(x_i), d, dp);
                     let ip_i = &ip[i * nlist..(i + 1) * nlist];
@@ -230,10 +237,13 @@ impl CoarseProjection {
                     for c in 0..nlist {
                         let bound = projected_distance_lower_bound(
                             xn,
+                            xn_sqrt,
                             self.cents_p_norms[c],
+                            self.cents_p_norms_sqrt[c],
                             ip_i[c],
                             x_error + self.cents_p_errors[c],
-                            dp,
+                            gemm_error_factor,
+                            f64_error_factor,
                         );
                         bounds[c] = bound;
                         if bound < bounds[first] {
@@ -281,12 +291,16 @@ impl CoarseProjection {
         sgemm_a_bt(1, dp, d, 1.0, x, &self.proj, 0.0, &mut xp);
         let cp = &self.cents_p[c * dp..(c + 1) * dp];
         let ip = xp.iter().zip(cp).map(|(a, b)| a * b).sum();
+        let x_norm = norm_l2sqr_f64(&xp);
         projected_distance_lower_bound(
-            norm_l2sqr_f64(&xp),
+            x_norm,
+            x_norm.sqrt(),
             self.cents_p_norms[c],
+            self.cents_p_norms_sqrt[c],
             ip,
             projection_error(norm_upper(x), d, dp) + self.cents_p_errors[c],
-            dp,
+            2.0 * gamma_f32(dp.saturating_mul(2).saturating_add(1)),
+            gamma_f64(dp.saturating_mul(2).saturating_add(8)),
         )
     }
 }
@@ -328,20 +342,28 @@ fn projection_error(norm: f64, d: usize, dp: usize) -> f64 {
 
 fn projected_distance_lower_bound(
     x_norm: f64,
+    x_norm_sqrt: f64,
     c_norm: f64,
+    c_norm_sqrt: f64,
     inner_product: f32,
     projection_error: f64,
-    dp: usize,
+    gemm_error_factor: f64,
+    f64_error_factor: f64,
 ) -> f64 {
     let inner_product = inner_product as f64;
     let magnitude = x_norm + c_norm + 2.0 * inner_product.abs();
-    let gemm_error =
-        2.0 * gamma_f32(dp.saturating_mul(2).saturating_add(1)) * (x_norm * c_norm).sqrt();
-    let f64_error = gamma_f64(dp.saturating_mul(2).saturating_add(8)) * magnitude;
-    let projected = (x_norm + c_norm - 2.0 * inner_product - gemm_error - f64_error)
-        .max(0.0)
-        .sqrt();
-    (projected - projection_error).max(0.0).powi(2)
+    let gemm_error = gemm_error_factor * x_norm_sqrt * c_norm_sqrt;
+    let f64_error = f64_error_factor * magnitude;
+    let projected_sqr = (x_norm + c_norm - 2.0 * inner_product - gemm_error - f64_error).max(0.0);
+    let error_sqr = projection_error * projection_error;
+    if projected_sqr <= error_sqr {
+        0.0
+    } else {
+        // sqrt(projected_sqr) <= |xp| + |cp|. Using that upper bound in
+        // (sqrt(projected_sqr) - projection_error)^2 keeps this conservative
+        // without a square root for every row-centroid pair.
+        (projected_sqr - 2.0 * projection_error * (x_norm_sqrt + c_norm_sqrt) + error_sqr).max(0.0)
+    }
 }
 
 fn distance_upper_bound(distance: f32, d: usize) -> f64 {
