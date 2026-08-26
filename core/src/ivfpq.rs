@@ -67,11 +67,10 @@ pub struct IVFPQIndex {
     pub metric: MetricType,
     pub by_residual: bool,
 
-    /// Coarse centroids (`nlist × d`). Private so that every replacement
-    /// goes through [`Self::set_quantizer_centroids`], which invalidates the
-    /// build-only projection and the precomputed search tables derived from
-    /// them.
-    quantizer_centroids: Vec<f32>,
+    /// Coarse centroids (`nlist × d`). Kept public for source compatibility;
+    /// use [`Self::set_quantizer_centroids`] so derived build/search state is
+    /// invalidated correctly.
+    pub quantizer_centroids: Vec<f32>,
     pub pq: ProductQuantizer,
     pub opq: Option<OPQMatrix>,
 
@@ -155,14 +154,18 @@ impl IVFPQIndex {
         &self.quantizer_centroids
     }
 
-    /// Replace the coarse centroids (`nlist × d` values). Drops the
-    /// precomputed search table and refits the build-only projection, so a
-    /// subsequent `add` assigns against the new centroids.
+    /// Replace the coarse centroids (`nlist × d` values) before vectors are
+    /// added. Drops the precomputed search table and refits the build-only
+    /// projection, so a subsequent `add` assigns against the new centroids.
     pub fn set_quantizer_centroids(&mut self, centroids: Vec<f32>) {
         assert_eq!(
             centroids.len(),
             self.nlist * self.d,
             "quantizer centroids must hold nlist * d values"
+        );
+        assert!(
+            self.ids.iter().all(Vec::is_empty),
+            "cannot replace quantizer centroids after vectors have been added"
         );
         self.quantizer_centroids = centroids;
         self.precomputed_table.clear();
@@ -3330,6 +3333,19 @@ mod tests {
             "vector must land in the replaced list"
         );
         assert!(index.ids[0].is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot replace quantizer centroids after vectors have been added")]
+    fn test_replacing_centroids_after_add_is_rejected() {
+        let d = 8;
+        let n = 32;
+        let data: Vec<f32> = (0..n * d).map(|i| (i % 17) as f32 * 0.01).collect();
+        let mut index = IVFPQIndex::with_nbits(d, 1, 2, 4, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data[..d], &[7], 1);
+
+        index.set_quantizer_centroids(index.quantizer_centroids().to_vec());
     }
 
     #[test]
