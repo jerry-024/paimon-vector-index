@@ -35,16 +35,15 @@
 //! never depends on how well the PCA converged; `P` only decides how many
 //! exact evaluations step 3 needs. Rows without low-dimensional structure
 //! degrade to checking every centroid, i.e. the exact scan plus one small
-//! GEMM. `d'` is therefore chosen by cost: at `train`, candidate widths are
-//! tried on a sample of training vectors, the number of exact checks each
-//! needs is measured, and the width minimizing
-//! `d'·nlist + 2·d'·d + w·checks·d` wins;
-//! automatic mode keeps the projection only when that cost is below
-//! the exact scan's `d·nlist`. (Without a sample the width falls back to 95%
-//! explained variance, gated by `d' ≤ d / 3`.)
+//! GEMM. At `train`, candidate widths are therefore timed on a sample of
+//! training vectors, including projection, bound construction, candidate
+//! collection, and exact checks. Automatic mode keeps the fastest projection
+//! only when it is clearly faster than an exact scan of the same sample.
+//! (Without a sample the width falls back to 95% explained variance, gated by
+//! `d' ≤ d / 3`.)
 //!
-//! The projection is a training artifact: it is derived deterministically from
-//! the centroids, shared by `IVFPQIndex::from_trained`, and never serialized.
+//! The projection is a training artifact: it is derived from the centroids,
+//! shared by `IVFPQIndex::from_trained`, and never serialized.
 
 use crate::blas::{dgemm_a_bt, sgemm_a_bt};
 use crate::distance::{fvec_l2sqr, fvec_l2sqr_four};
@@ -52,6 +51,7 @@ use nalgebra::{DMatrix, SymmetricEigen};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
+use std::time::{Duration, Instant};
 
 /// Fraction of centroid variance the projection must explain.
 const VARIANCE_TARGET: f64 = 0.95;
@@ -62,17 +62,8 @@ const MAX_AUTO_DP_DIVISOR: usize = 3;
 const MIN_CALIBRATION_ROWS: usize = 256;
 /// Rows of the training data used to calibrate `d'`.
 pub(crate) const CALIBRATION_ROWS: usize = 2048;
-/// Per-centroid cost of computing one bound, in GEMM multiply-add units.
-const BOUND_COST: f64 = 4.0;
-/// Row projection uses f64, with roughly half the SIMD lane throughput of the
-/// f32 projected-score GEMM.
-const ROW_PROJECTION_WEIGHT: f64 = 2.0;
-/// Cost of one exact-check multiply-add relative to a GEMM multiply-add:
-/// exact checks gather scattered centroids row by row, with no blocking.
-/// Fitted on Cohere-768 / nlist=4096 timings across d' = 32..384.
-const EXACT_CHECK_WEIGHT: f64 = 6.0;
 /// With a calibration sample, automatic mode keeps the projection only when
-/// its modeled cost is below this fraction of the exact scan.
+/// its measured time is below this fraction of the exact scan.
 const MAX_AUTO_COST_FRACTION: f64 = 0.85;
 /// Block subspace iterations; the bound stays valid regardless of convergence.
 const SUBSPACE_ITERATIONS: usize = 8;
@@ -141,12 +132,10 @@ impl CoarseProjection {
     ///
     /// `calibration` holds `calibration_rows` sample vectors in the centroid
     /// space (typically training vectors). When present, `d'` is chosen by
-    /// measuring, for each candidate width, how many exact distance checks
-    /// the branch-and-bound needs on that sample and picking the width that
-    /// minimizes `d' * nlist + ROW_PROJECTION_WEIGHT * d' * d +
-    /// EXACT_CHECK_WEIGHT * checks * d`; automatic mode then keeps the
-    /// projection only when that cost is clearly below the exact scan's
-    /// `d * nlist`. Without a sample, `d'` falls back to the smallest width
+    /// timing each candidate width on that sample and picking the fastest;
+    /// automatic mode then keeps the projection only when it is clearly
+    /// faster than an exact scan of the same sample. Without a sample, `d'`
+    /// falls back to the smallest width
     /// explaining `VARIANCE_TARGET` of the centroid variance, gated by
     /// `MAX_AUTO_DP_DIVISOR`.
     ///
@@ -195,7 +184,7 @@ impl CoarseProjection {
         let (basis, eigenvalues) = top_subspace(&centered, nlist, d, block);
         let calibration_rows = calibration_rows.min(calibration.len() / d.max(1));
         if calibration_rows >= MIN_CALIBRATION_ROWS {
-            let mut projection = Self::select_width_by_cost(
+            let mut projection = Self::select_width_by_time(
                 cents,
                 &basis,
                 nlist,
@@ -251,9 +240,9 @@ impl CoarseProjection {
         Some(dp)
     }
 
-    /// Width minimizing the measured per-row cost on the calibration sample.
+    /// Width minimizing elapsed assignment time on the calibration sample.
     #[allow(clippy::too_many_arguments)]
-    fn select_width_by_cost(
+    fn select_width_by_time(
         cents: &[f32],
         basis: &[f32],
         nlist: usize,
@@ -263,8 +252,15 @@ impl CoarseProjection {
         calibration: &[f32],
         calibration_rows: usize,
     ) -> Option<Self> {
-        let exact_cost = (d * nlist) as f64;
-        let mut best: Option<(f64, Self)> = None;
+        let exact_elapsed = if force {
+            None
+        } else {
+            let started = Instant::now();
+            let _ =
+                crate::kmeans::find_nearest_batch(calibration, calibration_rows, cents, nlist, d);
+            Some(started.elapsed())
+        };
+        let mut best: Option<(Duration, Self)> = None;
         let mut widths: Vec<usize> = [8usize, 4, 2]
             .iter()
             .map(|div| (block / div).div_ceil(MIN_DP) * MIN_DP)
@@ -279,25 +275,23 @@ impl CoarseProjection {
         let mut candidate = Self::from_basis(cents, basis, nlist, d, block, 0.0);
         for dp in widths.into_iter().rev() {
             candidate.truncate_dimension(dp);
-            let (_, evaluations) =
-                candidate.assign_with_stats(calibration, calibration_rows, cents, nlist);
-            let checks_per_row = evaluations as f64 / calibration_rows as f64;
-            let cost = dp as f64 * nlist as f64
-                + ROW_PROJECTION_WEIGHT * dp as f64 * d as f64
-                + EXACT_CHECK_WEIGHT * checks_per_row * d as f64
-                + BOUND_COST * nlist as f64;
-            if best.as_ref().is_none_or(|(c, _)| cost <= *c) {
-                best = Some((cost, candidate.clone()));
+            let started = Instant::now();
+            let _ = candidate.assign_with_stats(calibration, calibration_rows, cents, nlist);
+            let elapsed = started.elapsed();
+            if best.as_ref().is_none_or(|(time, _)| elapsed <= *time) {
+                best = Some((elapsed, candidate.clone()));
             }
         }
-        let (cost, candidate) = best?;
-        if !force && cost > exact_cost * MAX_AUTO_COST_FRACTION {
+        let (elapsed, candidate) = best?;
+        if let Some(exact_elapsed) =
+            exact_elapsed.filter(|exact_elapsed| !is_fast_enough(elapsed, *exact_elapsed))
+        {
             crate::logging::emit_log(
                 crate::logging::LogLevel::Info,
                 &format!(
-                    "IVF-PQ projected assignment not used: best width d'={} models {:.0}% of the exact scan cost",
+                    "IVF-PQ projected assignment not used: best width d'={} measured {:.0}% of exact scan time",
                     candidate.dp,
-                    cost / exact_cost * 100.0
+                    elapsed.as_secs_f64() / exact_elapsed.as_secs_f64() * 100.0
                 ),
             );
             return None;
@@ -598,6 +592,10 @@ impl CoarseProjection {
             gamma_f64(dp.saturating_mul(2).saturating_add(8)),
         ) + residual * residual
     }
+}
+
+fn is_fast_enough(projected: Duration, exact: Duration) -> bool {
+    projected <= exact.mul_f64(MAX_AUTO_COST_FRACTION)
 }
 
 fn gamma(unit_roundoff: f64, operations: usize) -> f64 {
@@ -1178,40 +1176,27 @@ mod tests {
     }
 
     #[test]
-    fn calibration_picks_a_cheaper_width_and_gates_on_cost() {
+    fn calibration_picks_a_fast_width_and_stays_exact() {
         let (nlist, d) = (512, 96);
         let cents = low_rank_centroids(nlist, d, 12, 0.3, 31);
         let rows = rows_like(&cents, nlist, d, 4000, 1.0, 32);
-        let calibrated = CoarseProjection::train(&cents, nlist, d, false, &rows, 2048).unwrap();
-        let variance_rule = CoarseProjection::train(&cents, nlist, d, false, &[], 0).unwrap();
-        assert!(calibrated.dimension() < d / MAX_AUTO_DP_DIVISOR);
+        let calibrated = CoarseProjection::train(&cents, nlist, d, true, &rows, 2048).unwrap();
+        assert!(calibrated.dimension() <= d / 2);
         let (got, cal_evals) = calibrated.assign_with_stats(&rows[2048 * d..], 1952, &cents, nlist);
         let exact: Vec<usize> = rows[2048 * d..]
             .chunks_exact(d)
             .map(|x| kmeans::find_nearest(x, &cents, nlist, d))
             .collect();
         assert_eq!(got, exact);
-        let (_, var_evals) =
-            variance_rule.assign_with_stats(&rows[2048 * d..], 1952, &cents, nlist);
-        let cost = |dp: usize, evals: usize| {
-            dp as f64 * nlist as f64
-                + ROW_PROJECTION_WEIGHT * dp as f64 * d as f64
-                + EXACT_CHECK_WEIGHT * evals as f64 * d as f64 / 1952.0
-                + BOUND_COST * nlist as f64
-        };
-        assert!(
-            cost(calibrated.dimension(), cal_evals) <= cost(variance_rule.dimension(), var_evals),
-            "calibrated d'={} ({cal_evals} checks) vs variance d'={} ({var_evals} checks)",
-            calibrated.dimension(),
-            variance_rule.dimension()
-        );
-        // Unstructured rows: the modeled cost exceeds the scan, auto declines.
-        let mut rng = StdRng::seed_from_u64(33);
-        let noise_cents: Vec<f32> = (0..nlist * d).map(|_| rng.gen::<f32>()).collect();
-        let noise_rows: Vec<f32> = (0..1024 * d).map(|_| rng.gen::<f32>()).collect();
-        assert!(
-            CoarseProjection::train(&noise_cents, nlist, d, false, &noise_rows, 1024).is_none()
-        );
+        assert!(cal_evals > 0);
+        assert!(is_fast_enough(
+            Duration::from_millis(85),
+            Duration::from_millis(100)
+        ));
+        assert!(!is_fast_enough(
+            Duration::from_millis(86),
+            Duration::from_millis(100)
+        ));
     }
 
     #[test]
