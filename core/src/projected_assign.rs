@@ -164,7 +164,7 @@ impl CoarseProjection {
         if !force && (block < MIN_DP || nlist < 2 * block) {
             return None;
         }
-        let block = block.min(nlist).max(1);
+        let block = block.min(nlist);
 
         let mean = column_mean(cents, nlist, d);
         let centered: Vec<f32> = cents
@@ -182,10 +182,11 @@ impl CoarseProjection {
         }
 
         let (basis, eigenvalues) = top_subspace(&centered, nlist, d, block);
-        let calibration_rows = calibration_rows.min(calibration.len() / d.max(1));
+        let calibration_rows = calibration_rows.min(calibration.len() / d);
         if calibration_rows >= MIN_CALIBRATION_ROWS {
             let mut projection = Self::select_width_by_time(
                 cents,
+                &mean,
                 &basis,
                 nlist,
                 d,
@@ -202,6 +203,7 @@ impl CoarseProjection {
         let explained_variance = eigenvalues[..dp].iter().sum::<f64>() / total_variance;
         Some(Self::from_basis(
             cents,
+            &mean,
             &basis,
             nlist,
             d,
@@ -244,6 +246,7 @@ impl CoarseProjection {
     #[allow(clippy::too_many_arguments)]
     fn select_width_by_time(
         cents: &[f32],
+        mean: &[f32],
         basis: &[f32],
         nlist: usize,
         d: usize,
@@ -272,7 +275,7 @@ impl CoarseProjection {
         }
         widths.sort_unstable();
         widths.dedup();
-        let mut candidate = Self::from_basis(cents, basis, nlist, d, block, 0.0);
+        let mut candidate = Self::from_basis(cents, mean, basis, nlist, d, block, 0.0);
         for dp in widths.into_iter().rev() {
             candidate.truncate_dimension(dp);
             let started = Instant::now();
@@ -350,6 +353,7 @@ impl CoarseProjection {
 
     fn from_basis(
         cents: &[f32],
+        mean: &[f32],
         basis: &[f32],
         nlist: usize,
         d: usize,
@@ -360,10 +364,7 @@ impl CoarseProjection {
         make_contractive(&mut proj_f32, dp, d);
         let (sigma_min_sq, sigma_max_sq) = singular_value_bounds(&proj_f32, dp, d);
         let proj: Vec<f64> = proj_f32.iter().map(|v| *v as f64).collect();
-        let mean: Vec<f64> = column_mean(cents, nlist, d)
-            .iter()
-            .map(|v| *v as f64)
-            .collect();
+        let mean: Vec<f64> = mean.iter().map(|v| *v as f64).collect();
         // Center and project in f64, then round to f32 for the row×centroid
         // GEMM. `cent_norms` are `|c - mean|²` in f64.
         let (cents_p, cent_norms) = project_rows(cents, nlist, d, &proj, dp, &mean);
@@ -745,9 +746,6 @@ fn distance_upper_bound(distance: f32, d: usize) -> f64 {
 /// the Gram entries (Gershgorin) and a relative margin for the eigensolver.
 /// Returns `(0, sigma_max²)` when the rows are numerically dependent.
 fn singular_value_bounds(proj: &[f32], rows: usize, d: usize) -> (f64, f64) {
-    if rows == 0 {
-        return (0.0, 0.0);
-    }
     let dot_roundoff = gamma_f64(d.saturating_mul(2).saturating_add(1));
     let mut gram = DMatrix::zeros(rows, rows);
     let mut max_entry_error = 0.0f64;
