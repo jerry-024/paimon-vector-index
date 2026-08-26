@@ -2948,15 +2948,20 @@ fn seed_heaps(heaps: &mut [TopKHeap], seed_ids: &[i64], seed_distances: &[f32], 
 
 // --- Utilities ---
 
-/// Evenly strided rows of the training data for projection calibration.
+/// Evenly spaced rows of the training data for projection calibration.
 fn calibration_sample(data: &[f32], n: usize, d: usize) -> Vec<f32> {
     let rows = crate::projected_assign::CALIBRATION_ROWS.min(n);
     if rows == 0 || d == 0 {
         return Vec::new();
     }
-    let stride = n / rows;
+    let quotient = n / rows;
+    let remainder = n % rows;
     (0..rows)
-        .flat_map(|i| data[i * stride * d..(i * stride + 1) * d].iter().copied())
+        .flat_map(|i| {
+            // floor(i * n / rows), without overflowing i * n.
+            let row = i * quotient + i * remainder / rows;
+            data[row * d..(row + 1) * d].iter().copied()
+        })
         .collect()
 }
 
@@ -3163,6 +3168,21 @@ mod tests {
                 buckets[i],
                 exact[i]
             );
+        }
+    }
+
+    #[test]
+    fn test_calibration_sample_spans_non_multiple_input() {
+        for n in [2049, 4095] {
+            let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            let sample = calibration_sample(&data, n, 1);
+            assert_eq!(sample.len(), crate::projected_assign::CALIBRATION_ROWS);
+            for (i, value) in sample.into_iter().enumerate() {
+                assert_eq!(
+                    value,
+                    (i * n / crate::projected_assign::CALIBRATION_ROWS) as f32
+                );
+            }
         }
     }
 
