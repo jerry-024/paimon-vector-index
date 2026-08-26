@@ -1244,9 +1244,9 @@ mod tests {
         let rows = rows_like(&cents, nlist, d, n, 1.0, 42);
         let shift = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| 1e8 + (x - 3.0) * 64.0).collect() };
         let (cents_t, rows_t) = (shift(&cents), shift(&rows));
-        // Forced: the elapsed-time gate is not the subject here.
-        let p = CoarseProjection::train(&cents, nlist, d, true, &rows, 2048).unwrap();
-        let p_t = CoarseProjection::train(&cents_t, nlist, d, true, &rows_t, 2048).unwrap();
+        // Forced without calibration: elapsed-time width selection is not the subject here.
+        let p = CoarseProjection::train(&cents, nlist, d, true, &[], 0).unwrap();
+        let p_t = CoarseProjection::train(&cents_t, nlist, d, true, &[], 0).unwrap();
         let (got, evals) = p.assign_with_stats(&rows, n, &cents, nlist);
         let (got_t, evals_t) = p_t.assign_with_stats(&rows_t, n, &cents_t, nlist);
         let argmin_f64 = |rows: &[f32], cents: &[f32]| -> Vec<usize> {
