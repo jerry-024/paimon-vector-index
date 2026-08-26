@@ -64,7 +64,7 @@ pub fn sgemm_a_bt(
 }
 
 /// f64 variant of [`sgemm_a_bt`]: C = alpha * A * B^T + beta * C.
-pub fn dgemm_a_bt(
+pub(crate) fn dgemm_a_bt(
     m: usize,
     n: usize,
     k: usize,

@@ -79,7 +79,9 @@ fn main() {
         }
         let add_seconds = add_elapsed.as_secs_f64();
         assert_eq!(index.ids.iter().map(Vec::len).sum::<usize>(), n);
-        report_agreement(&index, n, d, nlist, batch_size);
+        if run == 1 {
+            report_agreement(&index, n, d, nlist, batch_size);
+        }
         println!(
             "{n},{d},{nlist},{m},{train_n},{batch_size},{},{run},{add_seconds:.6},{:.0}",
             rayon::current_num_threads(),
