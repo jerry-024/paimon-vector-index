@@ -102,7 +102,7 @@ fn report_agreement(index: &IVFPQIndex, n: usize, d: usize, nlist: usize, batch_
             }
         }
     }
-    let cents = &index.quantizer_centroids;
+    let cents = index.quantizer_centroids();
     let agree = (0..check)
         .filter(|&i| find_nearest(&first[i * d..(i + 1) * d], cents, nlist, d) == bucket_of[i])
         .count();

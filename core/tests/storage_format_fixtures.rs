@@ -491,7 +491,7 @@ fn build_ivf_flat_fixture() -> Vec<u8> {
 
 fn build_ivf_pq_fixture() -> Vec<u8> {
     let mut index = IVFPQIndex::new(1, 2, 1, MetricType::L2, false);
-    index.quantizer_centroids = vec![0.0, 10.0];
+    index.set_quantizer_centroids(vec![0.0, 10.0]);
     index.pq.centroids = (0..index.pq.ksub).map(|code| code as f32 * 0.25).collect();
     index.pq.rebuild_norms_cache();
     index.ids = vec![vec![20, 10], vec![30]];
@@ -504,7 +504,7 @@ fn build_ivf_pq_fixture() -> Vec<u8> {
 
 fn build_ivf_pq_4bit_fixture() -> Vec<u8> {
     let mut index = IVFPQIndex::with_nbits(2, 2, 2, 4, MetricType::L2, false);
-    index.quantizer_centroids = vec![0.0, 0.0, 10.0, 10.0];
+    index.set_quantizer_centroids(vec![0.0, 0.0, 10.0, 10.0]);
     index.pq.centroids = (0..index.pq.m)
         .flat_map(|_| (0..index.pq.ksub).map(|code| code as f32 * 0.5))
         .collect();

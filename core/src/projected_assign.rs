@@ -473,23 +473,26 @@ impl CoarseProjection {
                         self.sigma_max_sq,
                     );
                     let ip_i = &ip[i * nlist..(i + 1) * nlist];
-                    for c in 0..nlist {
-                        // Reverse triangle inequality on the components outside
-                        // the subspace: |P₀⊥(x-c)| >= | |P₀⊥x| - |P₀⊥c| |, taken
-                        // at the worst case of both intervals.
-                        let residual = (x_res_lo - self.cents_res_hi[c])
-                            .max(self.cents_res_lo[c] - x_res_hi)
-                            .max(0.0);
-                        bounds[c] = projected_distance_lower_bound(
-                            xn,
-                            xn_sqrt,
-                            self.cents_p_norms[c],
-                            self.cents_p_norms_sqrt[c],
-                            ip_i[c],
-                            x_error + self.cents_p_errors[c],
-                            gemm_error_factor,
-                            f64_error_factor,
-                        ) + residual * residual;
+                    let row = RowBoundTerms {
+                        xn,
+                        xn_sqrt,
+                        x_error,
+                        gemm_scaled: gemm_error_factor * xn_sqrt,
+                        f64_error_factor,
+                        x_res_lo,
+                        x_res_hi,
+                    };
+                    // One straight-line pass per row: every term is a few
+                    // multiply-adds and a max, so the compiler can vectorize it.
+                    for (((((bound, &ip_c), &cn), &cs), &ce), (&rlo, &rhi)) in bounds
+                        .iter_mut()
+                        .zip(ip_i)
+                        .zip(&self.cents_p_norms)
+                        .zip(&self.cents_p_norms_sqrt)
+                        .zip(&self.cents_p_errors)
+                        .zip(self.cents_res_lo.iter().zip(&self.cents_res_hi))
+                    {
+                        *bound = pair_lower_bound(&row, ip_c, cn, cs, ce, rlo, rhi);
                     }
                     let min_bound = bounds.iter().copied().fold(f64::INFINITY, f64::min);
                     let first = bounds.iter().position(|&b| b == min_bound).unwrap_or(0);
@@ -578,19 +581,24 @@ impl CoarseProjection {
             self.sigma_min_sq,
             self.sigma_max_sq,
         );
-        let residual = (x_res_lo - self.cents_res_hi[c])
-            .max(self.cents_res_lo[c] - x_res_hi)
-            .max(0.0);
-        projected_distance_lower_bound(
-            x_norm,
-            x_norm.sqrt(),
+        let row = RowBoundTerms {
+            xn: x_norm,
+            xn_sqrt: x_norm.sqrt(),
+            x_error,
+            gemm_scaled: 2.0 * gamma_f32(dp.saturating_mul(2).saturating_add(1)) * x_norm.sqrt(),
+            f64_error_factor: gamma_f64(dp.saturating_mul(2).saturating_add(8)),
+            x_res_lo,
+            x_res_hi,
+        };
+        pair_lower_bound(
+            &row,
+            ip,
             self.cents_p_norms[c],
             self.cents_p_norms_sqrt[c],
-            ip,
-            x_error + self.cents_p_errors[c],
-            2.0 * gamma_f32(dp.saturating_mul(2).saturating_add(1)),
-            gamma_f64(dp.saturating_mul(2).saturating_add(8)),
-        ) + residual * residual
+            self.cents_p_errors[c],
+            self.cents_res_lo[c],
+            self.cents_res_hi[c],
+        )
     }
 }
 
@@ -667,30 +675,58 @@ fn projection_error(norm: f64, proj_norm: f64, d: usize, dp: usize) -> f64 {
         + (f32::EPSILON as f64 / 2.0) * proj_norm
 }
 
-fn projected_distance_lower_bound(
-    x_norm: f64,
-    x_norm_sqrt: f64,
+/// Per-row constants of the lower bound, hoisted out of the centroid loop.
+struct RowBoundTerms {
+    /// `|xp|²` and `|xp|` of the projected centered row (f64).
+    xn: f64,
+    xn_sqrt: f64,
+    /// Bound on the projection error of the row.
+    x_error: f64,
+    /// `gemm_error_factor · |xp|`; times `|cp|` it bounds the f32 GEMM error.
+    gemm_scaled: f64,
+    f64_error_factor: f64,
+    /// Interval for `|P₀⊥ x|`.
+    x_res_lo: f64,
+    x_res_hi: f64,
+}
+
+/// Lower bound on `|x - c|²` for one row/centroid pair: the projected
+/// distance with the f32 GEMM, f64 and projection errors subtracted, plus the
+/// reverse triangle inequality on the components outside the subspace
+/// (`|P₀⊥(x-c)| >= | |P₀⊥x| - |P₀⊥c| |`, at the worst case of both intervals).
+/// Branch-free so the per-row loop vectorizes.
+#[inline(always)]
+fn pair_lower_bound(
+    row: &RowBoundTerms,
+    inner_product: f32,
     c_norm: f64,
     c_norm_sqrt: f64,
-    inner_product: f32,
-    projection_error: f64,
-    gemm_error_factor: f64,
-    f64_error_factor: f64,
+    c_error: f64,
+    c_res_lo: f64,
+    c_res_hi: f64,
 ) -> f64 {
-    let inner_product = inner_product as f64;
-    let magnitude = x_norm + c_norm + 2.0 * inner_product.abs();
-    let gemm_error = gemm_error_factor * x_norm_sqrt * c_norm_sqrt;
-    let f64_error = f64_error_factor * magnitude;
-    let projected_sqr = (x_norm + c_norm - 2.0 * inner_product - gemm_error - f64_error).max(0.0);
+    let ip = inner_product as f64;
+    let magnitude = row.xn + c_norm + 2.0 * ip.abs();
+    let gemm_error = row.gemm_scaled * c_norm_sqrt;
+    let f64_error = row.f64_error_factor * magnitude;
+    let projected_sqr = (row.xn + c_norm - 2.0 * ip - gemm_error - f64_error).max(0.0);
+    let projection_error = row.x_error + c_error;
     let error_sqr = projection_error * projection_error;
-    if projected_sqr <= error_sqr {
-        0.0
+    // sqrt(projected_sqr) <= |xp| + |cp|. Using that upper bound in
+    // (sqrt(projected_sqr) - projection_error)^2 keeps this conservative
+    // without a square root per pair; it is zero once the error radius
+    // covers the projected distance.
+    let projected =
+        (projected_sqr - 2.0 * projection_error * (row.xn_sqrt + c_norm_sqrt) + error_sqr).max(0.0);
+    let projected = if projected_sqr > error_sqr {
+        projected
     } else {
-        // sqrt(projected_sqr) <= |xp| + |cp|. Using that upper bound in
-        // (sqrt(projected_sqr) - projection_error)^2 keeps this conservative
-        // without a square root for every row-centroid pair.
-        (projected_sqr - 2.0 * projection_error * (x_norm_sqrt + c_norm_sqrt) + error_sqr).max(0.0)
-    }
+        0.0
+    };
+    let residual = (row.x_res_lo - c_res_hi)
+        .max(c_res_lo - row.x_res_hi)
+        .max(0.0);
+    projected + residual * residual
 }
 
 fn distance_upper_bound(distance: f32, d: usize) -> f64 {
@@ -1197,6 +1233,47 @@ mod tests {
             Duration::from_millis(86),
             Duration::from_millis(100)
         ));
+    }
+
+    /// A common offset leaves every distance unchanged; the bound must stay
+    /// as tight (rank-8 centroids at `1e8 + (v-3)*64`).
+    #[test]
+    fn translated_low_rank_data_prunes_as_well_as_centered_data() {
+        let (nlist, d, n) = (512, 96, 4096);
+        let cents = low_rank_centroids(nlist, d, 8, 0.3, 41);
+        let rows = rows_like(&cents, nlist, d, n, 1.0, 42);
+        let shift = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| 1e8 + (x - 3.0) * 64.0).collect() };
+        let (cents_t, rows_t) = (shift(&cents), shift(&rows));
+        // Forced: the elapsed-time gate is not the subject here.
+        let p = CoarseProjection::train(&cents, nlist, d, true, &rows, 2048).unwrap();
+        let p_t = CoarseProjection::train(&cents_t, nlist, d, true, &rows_t, 2048).unwrap();
+        let (got, evals) = p.assign_with_stats(&rows, n, &cents, nlist);
+        let (got_t, evals_t) = p_t.assign_with_stats(&rows_t, n, &cents_t, nlist);
+        let argmin_f64 = |rows: &[f32], cents: &[f32]| -> Vec<usize> {
+            rows.chunks_exact(d)
+                .map(|x| {
+                    (0..nlist)
+                        .map(|c| {
+                            let dist: f64 = x
+                                .iter()
+                                .zip(&cents[c * d..(c + 1) * d])
+                                .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+                                .sum();
+                            (dist, c)
+                        })
+                        .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+                        .unwrap()
+                        .1
+                })
+                .collect()
+        };
+        assert_eq!(got, argmin_f64(&rows, &cents));
+        assert_eq!(got_t, argmin_f64(&rows_t, &cents_t));
+        assert!(evals < n * nlist / 20, "centered: {evals} checks");
+        assert!(
+            evals_t <= evals * 2,
+            "translated data pruned much worse: {evals_t} vs {evals} checks"
+        );
     }
 
     #[test]

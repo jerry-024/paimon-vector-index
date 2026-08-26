@@ -67,7 +67,11 @@ pub struct IVFPQIndex {
     pub metric: MetricType,
     pub by_residual: bool,
 
-    pub quantizer_centroids: Vec<f32>,
+    /// Coarse centroids (`nlist × d`). Private so that every replacement
+    /// goes through [`Self::set_quantizer_centroids`], which invalidates the
+    /// build-only projection and the precomputed search tables derived from
+    /// them.
+    quantizer_centroids: Vec<f32>,
     pub pq: ProductQuantizer,
     pub opq: Option<OPQMatrix>,
 
@@ -145,6 +149,24 @@ impl IVFPQIndex {
 
     pub fn coarse_projection(&self) -> Option<&CoarseProjection> {
         self.coarse_projection.as_deref()
+    }
+
+    pub fn quantizer_centroids(&self) -> &[f32] {
+        &self.quantizer_centroids
+    }
+
+    /// Replace the coarse centroids (`nlist × d` values). Drops the
+    /// precomputed search table and refits the build-only projection, so a
+    /// subsequent `add` assigns against the new centroids.
+    pub fn set_quantizer_centroids(&mut self, centroids: Vec<f32>) {
+        assert_eq!(
+            centroids.len(),
+            self.nlist * self.d,
+            "quantizer centroids must hold nlist * d values"
+        );
+        self.quantizer_centroids = centroids;
+        self.precomputed_table.clear();
+        self.rebuild_coarse_projection();
     }
 
     /// Create an index with automatic nlist based on target partition size.
@@ -606,10 +628,17 @@ impl IVFPQIndex {
         let d = self.d;
         let processed = match self.metric {
             MetricType::Cosine => {
-                let mut normalized = queries[..nq * d].to_vec();
-                for vector in normalized.chunks_exact_mut(d) {
-                    fvec_normalize(vector);
-                }
+                // Copy and normalize per chunk in parallel: a serial
+                // `to_vec()` of a 32k × 768 batch plus its first-touch page
+                // faults cost more than the normalization itself.
+                let mut normalized = vec![0.0f32; nq * d];
+                normalized
+                    .par_chunks_exact_mut(d)
+                    .zip(queries[..nq * d].par_chunks_exact(d))
+                    .for_each(|(dst, src)| {
+                        dst.copy_from_slice(src);
+                        fvec_normalize(dst);
+                    });
                 Cow::Owned(normalized)
             }
             MetricType::L2 | MetricType::InnerProduct => Cow::Borrowed(&queries[..nq * d]),
@@ -3254,6 +3283,33 @@ mod tests {
         let ids: Vec<i64> = (0..n as i64).collect();
         trained.add(&data, &ids, n);
         assert_buckets_match_exact(&trained, &data, n);
+    }
+
+    /// Replacing centroids after training must not leave `add` pruning with
+    /// bounds cached from the old centroids.
+    #[test]
+    fn test_replacing_centroids_after_train_rebuilds_projection() {
+        let d = 64;
+        let nlist = 512;
+        let n = 6000;
+        let data = generate_low_rank_data(n, d, 8, 0.05, 61);
+        let mut index = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false)
+            .with_projected_assignment(ProjectedAssignment::Enabled);
+        index.train(&data, n);
+        assert!(index.coarse_projection().is_some());
+
+        let mut centroids = index.quantizer_centroids().to_vec();
+        let moved: Vec<f32> = centroids[..d].iter().map(|v| v + 0.1).collect();
+        centroids[500 * d..501 * d].copy_from_slice(&moved);
+        index.set_quantizer_centroids(centroids);
+
+        index.add(&moved, &[7], 1);
+        assert_eq!(
+            index.ids[500],
+            vec![7],
+            "vector must land in the replaced list"
+        );
+        assert!(index.ids[0].is_empty());
     }
 
     #[test]
