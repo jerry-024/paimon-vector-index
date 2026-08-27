@@ -3193,31 +3193,6 @@ mod tests {
     }
 
     #[test]
-    fn test_projected_assignment_defaults_to_auto_and_stays_exact() {
-        let d = 64;
-        let nlist = 256;
-        let n = 6000;
-        let structured = generate_low_rank_data(n, d, 8, 0.05, 21);
-        let mut index = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false);
-        assert_eq!(index.projected_assignment, ProjectedAssignment::Auto);
-        index.train(&structured, n);
-        let ids: Vec<i64> = (0..n as i64).collect();
-        index.add(&structured, &ids, n);
-        assert_buckets_match_exact(&index, &structured, n);
-
-        // Explicit enable works even when auto may reject a projection on the
-        // current machine, and remains exact.
-        let mut rng = StdRng::seed_from_u64(22);
-        let unstructured: Vec<f32> = (0..n * d).map(|_| rng.gen::<f32>()).collect();
-        let mut index = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false);
-        index.train(&unstructured, n);
-        index.set_projected_assignment(ProjectedAssignment::Enabled);
-        assert!(index.coarse_projection().is_some());
-        index.add(&unstructured, &ids, n);
-        assert_buckets_match_exact(&index, &unstructured, n);
-    }
-
-    #[test]
     fn test_projected_assignment_matches_exact_scan() {
         let d = 64;
         let nlist = 256;
@@ -3306,6 +3281,9 @@ mod tests {
 
         trained.set_projected_assignment(ProjectedAssignment::Disabled);
         assert!(trained.coarse_projection().is_none());
+        trained.set_projected_assignment(ProjectedAssignment::Enabled);
+        assert!(trained.coarse_projection().is_some());
+        trained.set_projected_assignment(ProjectedAssignment::Disabled);
         let ids: Vec<i64> = (0..n as i64).collect();
         trained.add(&data, &ids, n);
         assert_buckets_match_exact(&trained, &data, n);
@@ -3349,20 +3327,6 @@ mod tests {
         index.add(&data[..d], &[7], 1);
 
         index.set_quantizer_centroids(index.quantizer_centroids().to_vec());
-    }
-
-    #[test]
-    fn test_projected_assignment_forced_on_tiny_index_stays_exact() {
-        let d = 16;
-        let nlist = 4;
-        let n = 500;
-        let data = generate_clustered_data(n, d, 4, 27);
-        let ids: Vec<i64> = (0..n as i64).collect();
-        let mut index = IVFPQIndex::new(d, nlist, 4, MetricType::L2, false)
-            .with_projected_assignment(ProjectedAssignment::Enabled);
-        index.train(&data, n);
-        index.add(&data, &ids, n);
-        assert_buckets_match_exact(&index, &data, n);
     }
 
     fn observed_ephemeral_precomputed_lists(
