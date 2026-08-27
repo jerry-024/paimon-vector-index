@@ -3312,6 +3312,20 @@ mod tests {
     }
 
     #[test]
+    fn test_manual_centroid_load_in_auto_mode_skips_projection_without_calibration() {
+        let d = 64;
+        let nlist = 512;
+        let centroids = generate_low_rank_data(nlist, d, 8, 0.05, 62);
+        let mut index = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false);
+
+        index.set_quantizer_centroids(centroids);
+
+        assert!(index.coarse_projection().is_none());
+        // Empty centroids prove Auto returns before reading or projecting them.
+        assert!(CoarseProjection::train(&[], nlist, d, false, &[], 0).is_none());
+    }
+
+    #[test]
     #[should_panic(expected = "cannot replace quantizer centroids after vectors have been added")]
     fn test_replacing_centroids_after_add_is_rejected() {
         let d = 8;

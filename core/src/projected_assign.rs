@@ -156,6 +156,10 @@ impl CoarseProjection {
         if nlist == 0 || d == 0 {
             return None;
         }
+        let calibration_rows = calibration_rows.min(calibration.len() / d);
+        if !force && calibration_rows < MIN_CALIBRATION_ROWS {
+            return None;
+        }
         // Largest d' auto mode may pick, rounded down so the gate below holds;
         // forced mode searches up to d / 2 (beyond that the projected GEMM
         // costs about as much as the scan it is meant to replace).
@@ -186,7 +190,6 @@ impl CoarseProjection {
         }
 
         let (basis, eigenvalues) = top_subspace(&centered, nlist, d, block);
-        let calibration_rows = calibration_rows.min(calibration.len() / d.max(1));
         let mut projection = if calibration_rows >= MIN_CALIBRATION_ROWS {
             Self::select_width_by_time(
                 cents,
