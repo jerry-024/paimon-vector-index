@@ -87,6 +87,10 @@ pub struct IVFPQIndex {
     /// instead of a full scan. Derived from the centroids in `train`, shared
     /// by `from_trained`, never serialized.
     coarse_projection: Option<Arc<CoarseProjection>>,
+    /// Strided sample of the training vectors (centroid space) used to
+    /// calibrate the projection width; kept so the projection can be refit
+    /// when the centroids or the mode change after training.
+    calibration_sample: Option<Arc<[f32]>>,
     pub(crate) projected_assignment: ProjectedAssignment,
 }
 
@@ -125,6 +129,7 @@ impl IVFPQIndex {
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
             coarse_projection: None,
+            calibration_sample: None,
             projected_assignment: ProjectedAssignment::Auto,
         }
     }
@@ -221,6 +226,7 @@ impl IVFPQIndex {
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
             coarse_projection: trained.coarse_projection.clone(),
+            calibration_sample: trained.calibration_sample.clone(),
             projected_assignment: trained.projected_assignment,
         }
     }
@@ -265,32 +271,29 @@ impl IVFPQIndex {
             effective_data
         };
         self.pq.train(&pq_train_data, n);
-        self.rebuild_coarse_projection_with(&calibration, calibration.len() / d.max(1));
+        self.calibration_sample = Some(Arc::from(calibration));
+        self.rebuild_coarse_projection();
     }
 
-    /// Fit the build-only centroid projection used by `add`. Auto mode keeps
-    /// it only when the centroids are compressible enough for the projected
-    /// branch-and-bound to beat the exact scan; the result is exact either way.
+    /// Fit the build-only centroid projection used by `add` from the current
+    /// centroids and the calibration sample kept from training. Auto mode
+    /// keeps it only when it measures faster than the exact scan on that
+    /// sample; the result is exact either way.
     fn rebuild_coarse_projection(&mut self) {
-        self.rebuild_coarse_projection_with(&[], 0);
-    }
-
-    /// `calibration` (`rows × d`, centroid space) lets the projection pick its
-    /// width by measured cost; without it the variance rule applies.
-    fn rebuild_coarse_projection_with(&mut self, calibration: &[f32], rows: usize) {
         self.coarse_projection = None;
         let force = match self.projected_assignment {
             ProjectedAssignment::Disabled => return,
             ProjectedAssignment::Enabled => true,
             ProjectedAssignment::Auto => false,
         };
+        let sample: &[f32] = self.calibration_sample.as_deref().unwrap_or(&[]);
         let projection = CoarseProjection::train(
             &self.quantizer_centroids,
             self.nlist,
             self.d,
             force,
-            calibration,
-            rows,
+            sample,
+            sample.len() / self.d.max(1),
         );
         match &projection {
             Some(p) => emit_log(

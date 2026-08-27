@@ -39,8 +39,8 @@
 //! training vectors, including projection, bound construction, candidate
 //! collection, and exact checks. Automatic mode keeps the fastest projection
 //! only when it is clearly faster than an exact scan of the same sample.
-//! (Without a sample the width falls back to 95% explained variance, gated by
-//! `d' ≤ d / 3`.)
+//! Without a sample, forced mode takes the widest candidate and automatic
+//! mode leaves the exact scan in place.
 //!
 //! The projection is a training artifact: it is derived from the centroids,
 //! shared by `IVFPQIndex::from_trained`, and never serialized.
@@ -53,12 +53,9 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
 
-/// Fraction of centroid variance the projection must explain.
-const VARIANCE_TARGET: f64 = 0.95;
-/// Without a calibration sample, automatic mode keeps the projection only
-/// when `d' * MAX_AUTO_DP_DIVISOR <= d`.
+/// Automatic mode only times widths with `d' * MAX_AUTO_DP_DIVISOR <= d`.
 const MAX_AUTO_DP_DIVISOR: usize = 3;
-/// Calibration samples below this fall back to the variance rule.
+/// Calibration samples below this count as absent.
 const MIN_CALIBRATION_ROWS: usize = 256;
 /// Rows of the training data used to calibrate `d'`.
 pub(crate) const CALIBRATION_ROWS: usize = 2048;
@@ -72,8 +69,20 @@ const SUBSPACE_SEED: u64 = 0x7a5e_c7ed;
 const MIN_DP: usize = 8;
 /// Rows per parallel block; the projected score matrix is `rows × nlist`.
 const MAX_BLOCK_ROWS: usize = 1024;
-/// Leave a visible margin below one after rounding the projection to f32.
-const CONTRACTION_MARGIN: f64 = 0.999;
+/// The projection is re-orthonormalized in f64 and scaled by
+/// `1 - ORTHO_MARGIN`, so its Gram matrix is `(1 - ORTHO_MARGIN)² · I` up to
+/// rounding. `orthonormal_f64` verifies (Gershgorin, including the f64
+/// rounding of the Gram entries) that every eigenvalue of `P Pᵀ` lies within
+/// `GRAM_MARGIN` of that diagonal, and declines the projection otherwise, so
+/// the constant singular-value bounds below hold for every stored
+/// projection. Gram-Schmidt typically lands within ~1e-15.
+const ORTHO_MARGIN: f64 = 1e-9;
+const GRAM_MARGIN: f64 = 1e-9;
+/// Bounds on the squared singular values of the stored projection (see
+/// `ORTHO_MARGIN`): `|P v|² / SIGMA_MAX_SQ <= |P₀ v|² <= |P v|² / SIGMA_MIN_SQ`
+/// for the orthonormal basis `P₀` of its row space.
+const SIGMA_MAX_SQ: f64 = 1.0;
+const SIGMA_MIN_SQ: f64 = (1.0 - ORTHO_MARGIN) * (1.0 - ORTHO_MARGIN) * (1.0 - GRAM_MARGIN);
 /// Candidates evaluated per branch-and-bound stage before re-pruning.
 const STAGE: usize = 32;
 
@@ -114,13 +123,10 @@ pub struct CoarseProjection {
     cents_p_norms_sqrt: Vec<f64>,
     /// Upper bound on the f32 GEMM error in each projected centroid.
     cents_p_errors: Vec<f64>,
-    /// `|c - mean|²`, reused while calibrating narrower projections.
-    cent_norms: Vec<f64>,
-    /// Bounds on the squared singular values of `proj`: `|P v|² / sigma_max_sq
-    /// <= |P₀ v|² <= |P v|² / sigma_min_sq` for the orthonormal basis `P₀` of
-    /// its row space. `sigma_min_sq == 0` disables the residual term.
-    sigma_min_sq: f64,
-    sigma_max_sq: f64,
+    /// Relative error factors of the `rows × nlist` f32 GEMM and of the f64
+    /// arithmetic in the bound, fixed by `dp`.
+    gemm_error_factor: f64,
+    f64_error_factor: f64,
     /// Interval for `|P₀⊥ c|`, the norm of each centroid's component outside
     /// the projected subspace, including every rounding error above.
     cents_res_lo: Vec<f64>,
@@ -131,13 +137,11 @@ impl CoarseProjection {
     /// Fit a projection to `nlist` centroids of dimension `d`.
     ///
     /// `calibration` holds `calibration_rows` sample vectors in the centroid
-    /// space (typically training vectors). When present, `d'` is chosen by
-    /// timing each candidate width on that sample and picking the fastest;
-    /// automatic mode then keeps the projection only when it is clearly
-    /// faster than an exact scan of the same sample. Without a sample, `d'`
-    /// falls back to the smallest width
-    /// explaining `VARIANCE_TARGET` of the centroid variance, gated by
-    /// `MAX_AUTO_DP_DIVISOR`.
+    /// space (typically training vectors). Candidate widths up to `d / 3`
+    /// (`d / 2` when forced) are timed on that sample and the fastest wins;
+    /// automatic mode keeps the projection only when it also beats the exact
+    /// scan on the sample by `MAX_AUTO_COST_FRACTION`. Without a sample,
+    /// forced mode takes the widest width and automatic mode builds nothing.
     ///
     /// Returns `None` when the projection is not worth it (`force == false`)
     /// or cannot be built (too few centroids, zero variance).
@@ -170,7 +174,7 @@ impl CoarseProjection {
         let centered: Vec<f32> = cents
             .iter()
             .enumerate()
-            .map(|(i, v)| v - mean[i % d])
+            .map(|(i, v)| v - mean[i % d] as f32)
             .collect();
         let total_variance = centered
             .iter()
@@ -182,9 +186,9 @@ impl CoarseProjection {
         }
 
         let (basis, eigenvalues) = top_subspace(&centered, nlist, d, block);
-        let calibration_rows = calibration_rows.min(calibration.len() / d);
-        if calibration_rows >= MIN_CALIBRATION_ROWS {
-            let mut projection = Self::select_width_by_time(
+        let calibration_rows = calibration_rows.min(calibration.len() / d.max(1));
+        let mut projection = if calibration_rows >= MIN_CALIBRATION_ROWS {
+            Self::select_width_by_time(
                 cents,
                 &mean,
                 &basis,
@@ -194,59 +198,23 @@ impl CoarseProjection {
                 force,
                 &calibration[..calibration_rows * d],
                 calibration_rows,
-            )?;
-            projection.explained_variance =
-                eigenvalues[..projection.dp].iter().sum::<f64>() / total_variance;
-            return Some(projection);
-        }
-        let dp = Self::select_width_by_variance(&eigenvalues, total_variance, block, d, force)?;
-        let explained_variance = eigenvalues[..dp].iter().sum::<f64>() / total_variance;
-        Some(Self::from_basis(
-            cents,
-            &mean,
-            &basis,
-            nlist,
-            d,
-            dp,
-            explained_variance,
-        ))
-    }
-
-    /// Smallest width explaining `VARIANCE_TARGET` of the centroid variance.
-    fn select_width_by_variance(
-        eigenvalues: &[f64],
-        total_variance: f64,
-        block: usize,
-        d: usize,
-        force: bool,
-    ) -> Option<usize> {
-        let target = VARIANCE_TARGET * total_variance;
-        let mut cumulative = 0.0;
-        let mut dp = None;
-        for (i, lambda) in eigenvalues.iter().enumerate() {
-            cumulative += lambda;
-            if cumulative >= target {
-                dp = Some(i + 1);
-                break;
-            }
-        }
-        let dp = match dp {
-            Some(dp) => dp.div_ceil(MIN_DP) * MIN_DP,
-            None if force => block,
-            None => return None,
-        }
-        .min(block);
-        if !force && dp * MAX_AUTO_DP_DIVISOR > d {
+            )?
+        } else if force {
+            // No sample to time against: take the widest projection.
+            Self::from_basis(cents, &mean, &basis, nlist, d, block)?
+        } else {
             return None;
-        }
-        Some(dp)
+        };
+        projection.explained_variance =
+            eigenvalues[..projection.dp].iter().sum::<f64>() / total_variance;
+        Some(projection)
     }
 
     /// Width minimizing elapsed assignment time on the calibration sample.
     #[allow(clippy::too_many_arguments)]
     fn select_width_by_time(
         cents: &[f32],
-        mean: &[f32],
+        mean: &[f64],
         basis: &[f32],
         nlist: usize,
         d: usize,
@@ -275,14 +243,15 @@ impl CoarseProjection {
         }
         widths.sort_unstable();
         widths.dedup();
-        let mut candidate = Self::from_basis(cents, mean, basis, nlist, d, block, 0.0);
         for dp in widths.into_iter().rev() {
-            candidate.truncate_dimension(dp);
+            let Some(candidate) = Self::from_basis(cents, mean, basis, nlist, d, dp) else {
+                continue;
+            };
             let started = Instant::now();
             let _ = candidate.assign_with_stats(calibration, calibration_rows, cents, nlist);
             let elapsed = started.elapsed();
             if best.as_ref().is_none_or(|(time, _)| elapsed <= *time) {
-                best = Some((elapsed, candidate.clone()));
+                best = Some((elapsed, candidate));
             }
         }
         let (elapsed, candidate) = best?;
@@ -302,69 +271,16 @@ impl CoarseProjection {
         Some(candidate)
     }
 
-    fn truncate_dimension(&mut self, dp: usize) {
-        if dp == self.dp {
-            return;
-        }
-        debug_assert!(dp < self.dp);
-        let old_dp = self.dp;
-        self.proj.truncate(dp * self.d);
-        self.cents_p = self
-            .cents_p
-            .chunks_exact(old_dp)
-            .flat_map(|row| row[..dp].iter().copied())
-            .collect();
-        self.dp = dp;
-
-        // By eigenvalue interlacing, the full-width singular-value bounds are
-        // conservative for every row prefix.
-        self.cents_p_norms = self.cents_p.chunks_exact(dp).map(norm_l2sqr_f64).collect();
-        self.cents_p_norms_sqrt = self.cents_p_norms.iter().map(|norm| norm.sqrt()).collect();
-        self.cents_p_errors = self
-            .cents_p_norms_sqrt
-            .iter()
-            .zip(&self.cent_norms)
-            .map(|(proj_norm, &cent_norm)| {
-                projection_error(
-                    centered_norm_upper(cent_norm, self.d),
-                    *proj_norm,
-                    self.d,
-                    dp,
-                )
-            })
-            .collect();
-        (self.cents_res_lo, self.cents_res_hi) = self
-            .cent_norms
-            .iter()
-            .zip(&self.cents_p_norms)
-            .zip(&self.cents_p_errors)
-            .map(|((&cent_norm, &proj_norm), &error)| {
-                residual_interval(
-                    cent_norm,
-                    self.d,
-                    proj_norm,
-                    error,
-                    self.sigma_min_sq,
-                    self.sigma_max_sq,
-                )
-            })
-            .unzip();
-    }
-
     fn from_basis(
         cents: &[f32],
-        mean: &[f32],
+        mean: &[f64],
         basis: &[f32],
         nlist: usize,
         d: usize,
         dp: usize,
-        explained_variance: f64,
-    ) -> Self {
-        let mut proj_f32 = basis[..dp * d].to_vec();
-        make_contractive(&mut proj_f32, dp, d);
-        let (sigma_min_sq, sigma_max_sq) = singular_value_bounds(&proj_f32, dp, d);
-        let proj: Vec<f64> = proj_f32.iter().map(|v| *v as f64).collect();
-        let mean: Vec<f64> = mean.iter().map(|v| *v as f64).collect();
+    ) -> Option<Self> {
+        let proj = orthonormal_f64(&basis[..dp * d], dp, d)?;
+        let mean = mean.to_vec();
         // Center and project in f64, then round to f32 for the row×centroid
         // GEMM. `cent_norms` are `|c - mean|²` in f64.
         let (cents_p, cent_norms) = project_rows(cents, nlist, d, &proj, dp, &mean);
@@ -383,33 +299,23 @@ impl CoarseProjection {
             })
             .collect();
         let (cents_res_lo, cents_res_hi): (Vec<f64>, Vec<f64>) = (0..nlist)
-            .map(|c| {
-                residual_interval(
-                    cent_norms[c],
-                    d,
-                    cents_p_norms[c],
-                    cents_p_errors[c],
-                    sigma_min_sq,
-                    sigma_max_sq,
-                )
-            })
+            .map(|c| residual_interval(cent_norms[c], d, cents_p_norms[c], cents_p_errors[c]))
             .unzip();
-        Self {
+        Some(Self {
             d,
             dp,
-            explained_variance,
+            explained_variance: 0.0,
             mean,
             proj,
             cents_p,
             cents_p_norms,
             cents_p_norms_sqrt,
             cents_p_errors,
-            cent_norms,
-            sigma_min_sq,
-            sigma_max_sq,
+            gemm_error_factor: 2.0 * gamma_f32(dp.saturating_mul(2).saturating_add(1)),
+            f64_error_factor: gamma_f64(dp.saturating_mul(2).saturating_add(8)),
             cents_res_lo,
             cents_res_hi,
-        }
+        })
     }
 
     pub fn dimension(&self) -> usize {
@@ -437,8 +343,6 @@ impl CoarseProjection {
     ) -> (Vec<usize>, usize) {
         let d = self.d;
         let dp = self.dp;
-        let gemm_error_factor = 2.0 * gamma_f32(dp.saturating_mul(2).saturating_add(1));
-        let f64_error_factor = gamma_f64(dp.saturating_mul(2).saturating_add(8));
         debug_assert_eq!(self.cents_p.len(), nlist * dp);
         let mut out = vec![0usize; n];
         let (block_rows, _) =
@@ -460,41 +364,13 @@ impl CoarseProjection {
                 let mut evaluations = 0usize;
                 for i in 0..rows {
                     let xp_i = &xp[i * dp..(i + 1) * dp];
-                    let xn = norm_l2sqr_f64(xp_i);
-                    let xn_sqrt = xn.sqrt();
                     let x_i = &x[i * d..(i + 1) * d];
-                    let x_error =
-                        projection_error(centered_norm_upper(x_norms[i], d), xn_sqrt, d, dp);
-                    let (x_res_lo, x_res_hi) = residual_interval(
+                    self.row_bounds(
+                        xp_i,
                         x_norms[i],
-                        d,
-                        xn,
-                        x_error,
-                        self.sigma_min_sq,
-                        self.sigma_max_sq,
+                        &ip[i * nlist..(i + 1) * nlist],
+                        &mut bounds,
                     );
-                    let ip_i = &ip[i * nlist..(i + 1) * nlist];
-                    let row = RowBoundTerms {
-                        xn,
-                        xn_sqrt,
-                        x_error,
-                        gemm_scaled: gemm_error_factor * xn_sqrt,
-                        f64_error_factor,
-                        x_res_lo,
-                        x_res_hi,
-                    };
-                    // One straight-line pass per row: every term is a few
-                    // multiply-adds and a max, so the compiler can vectorize it.
-                    for (((((bound, &ip_c), &cn), &cs), &ce), (&rlo, &rhi)) in bounds
-                        .iter_mut()
-                        .zip(ip_i)
-                        .zip(&self.cents_p_norms)
-                        .zip(&self.cents_p_norms_sqrt)
-                        .zip(&self.cents_p_errors)
-                        .zip(self.cents_res_lo.iter().zip(&self.cents_res_hi))
-                    {
-                        *bound = pair_lower_bound(&row, ip_c, cn, cs, ce, rlo, rhi);
-                    }
                     let min_bound = bounds.iter().copied().fold(f64::INFINITY, f64::min);
                     let first = bounds.iter().position(|&b| b == min_bound).unwrap_or(0);
                     let mut best = fvec_l2sqr(x_i, &cents[first * d..(first + 1) * d]);
@@ -564,42 +440,58 @@ impl CoarseProjection {
         (out, evaluations)
     }
 
-    /// Lower bound of `|x - c|²` for one row/centroid pair, for tests.
-    #[cfg(test)]
-    fn lower_bound(&self, x: &[f32], c: usize) -> f64 {
-        let d = self.d;
-        let dp = self.dp;
-        let (xp, x_norms) = project_rows(x, 1, d, &self.proj, dp, &self.mean);
-        let cp = &self.cents_p[c * dp..(c + 1) * dp];
-        let ip = xp.iter().zip(cp).map(|(a, b)| a * b).sum();
-        let x_norm = norm_l2sqr_f64(&xp);
-        let x_error = projection_error(centered_norm_upper(x_norms[0], d), x_norm.sqrt(), d, dp);
-        let (x_res_lo, x_res_hi) = residual_interval(
-            x_norms[0],
-            d,
-            x_norm,
-            x_error,
-            self.sigma_min_sq,
-            self.sigma_max_sq,
-        );
+    /// Lower bounds on `|x - c|²` for one projected row against every
+    /// centroid. `xp` is the row's projection (f32, centered), `x_norm_sq` its
+    /// centered f64 squared norm and `ip` its f32 inner products with
+    /// `cents_p`.
+    #[inline(always)]
+    fn row_bounds(&self, xp: &[f32], x_norm_sq: f64, ip: &[f32], bounds: &mut [f64]) {
+        let (d, dp) = (self.d, self.dp);
+        let (gemm_error_factor, f64_error_factor) = (self.gemm_error_factor, self.f64_error_factor);
+        let xn = norm_l2sqr_f64(xp);
+        let xn_sqrt = xn.sqrt();
+        let x_error = projection_error(centered_norm_upper(x_norm_sq, d), xn_sqrt, d, dp);
+        let (x_res_lo, x_res_hi) = residual_interval(x_norm_sq, d, xn, x_error);
         let row = RowBoundTerms {
-            xn: x_norm,
-            xn_sqrt: x_norm.sqrt(),
+            xn,
+            xn_sqrt,
             x_error,
-            gemm_scaled: 2.0 * gamma_f32(dp.saturating_mul(2).saturating_add(1)) * x_norm.sqrt(),
-            f64_error_factor: gamma_f64(dp.saturating_mul(2).saturating_add(8)),
+            gemm_scaled: gemm_error_factor * xn_sqrt,
+            f64_error_factor,
             x_res_lo,
             x_res_hi,
         };
-        pair_lower_bound(
-            &row,
-            ip,
-            self.cents_p_norms[c],
-            self.cents_p_norms_sqrt[c],
-            self.cents_p_errors[c],
-            self.cents_res_lo[c],
-            self.cents_res_hi[c],
-        )
+        // One straight-line pass per row: every term is a few multiply-adds
+        // and a max, so the compiler can vectorize it.
+        for (((((bound, &ip_c), &cn), &cs), &ce), (&rlo, &rhi)) in bounds
+            .iter_mut()
+            .zip(ip)
+            .zip(&self.cents_p_norms)
+            .zip(&self.cents_p_norms_sqrt)
+            .zip(&self.cents_p_errors)
+            .zip(self.cents_res_lo.iter().zip(&self.cents_res_hi))
+        {
+            *bound = pair_lower_bound(&row, ip_c, cn, cs, ce, rlo, rhi);
+        }
+    }
+
+    /// Lower bound of `|x - c|²` for one row/centroid pair, for tests.
+    #[cfg(test)]
+    fn lower_bound(&self, x: &[f32], c: usize) -> f64 {
+        let (d, dp) = (self.d, self.dp);
+        let nlist = self.cents_p.len() / dp;
+        let (xp, x_norms) = project_rows(x, 1, d, &self.proj, dp, &self.mean);
+        let ip: Vec<f32> = (0..nlist)
+            .map(|k| {
+                xp.iter()
+                    .zip(&self.cents_p[k * dp..(k + 1) * dp])
+                    .map(|(a, b)| a * b)
+                    .sum()
+            })
+            .collect();
+        let mut bounds = vec![0.0f64; nlist];
+        self.row_bounds(&xp, x_norms[0], &ip, &mut bounds);
+        bounds[c]
     }
 }
 
@@ -741,61 +633,16 @@ fn distance_upper_bound(distance: f32, d: usize) -> f64 {
     distance as f64 / (1.0 - relative_error) + d as f64 * f32::MIN_POSITIVE as f64
 }
 
-/// Conservative `[sigma_min², sigma_max²]` of the `rows × d` matrix `proj`
-/// from the eigenvalues of its Gram matrix, widened by the f64 rounding of
-/// the Gram entries (Gershgorin) and a relative margin for the eigensolver.
-/// Returns `(0, sigma_max²)` when the rows are numerically dependent.
-fn singular_value_bounds(proj: &[f32], rows: usize, d: usize) -> (f64, f64) {
-    let dot_roundoff = gamma_f64(d.saturating_mul(2).saturating_add(1));
-    let mut gram = DMatrix::zeros(rows, rows);
-    let mut max_entry_error = 0.0f64;
-    for i in 0..rows {
-        let mut row_error = 0.0;
-        for j in 0..rows {
-            let mut dot = 0.0;
-            let mut absolute_sum = 0.0;
-            for (a, b) in proj[i * d..(i + 1) * d]
-                .iter()
-                .zip(&proj[j * d..(j + 1) * d])
-            {
-                let product = (*a as f64) * (*b as f64);
-                dot += product;
-                absolute_sum += product.abs();
-            }
-            gram[(i, j)] = dot;
-            row_error += dot_roundoff * absolute_sum;
-        }
-        max_entry_error = max_entry_error.max(row_error);
-    }
-    let eigen = SymmetricEigen::new(gram);
-    let lambda_max = eigen.eigenvalues.iter().cloned().fold(0.0f64, f64::max);
-    let lambda_min = eigen
-        .eigenvalues
-        .iter()
-        .cloned()
-        .fold(f64::INFINITY, f64::min);
-    let solver_margin = lambda_max * 1e-9 + max_entry_error;
-    let sigma_max_sq = lambda_max + solver_margin;
-    let sigma_min_sq = lambda_min - solver_margin;
-    if sigma_min_sq.is_nan() || sigma_min_sq <= 0.0 || !sigma_max_sq.is_finite() {
-        (0.0, sigma_max_sq.max(0.0))
-    } else {
-        (sigma_min_sq, sigma_max_sq)
-    }
-}
-
 /// Interval for `|P₀⊥ v|` given `|v|²` of the centered vector in f64 (`d`
 /// components), `|P v|²` as computed in f32 (`proj_norm_sq`, in f64), a bound
 /// `proj_error` on `|P v - (P v)ᶜᵒᵐᵖ|`,
 /// and the singular-value bounds of `P`. Every rounding error widens the
-/// interval; `sigma_min_sq == 0` yields `[0, |v|]`, i.e. no residual term.
+/// interval.
 fn residual_interval(
     full_norm_sq: f64,
     d: usize,
     proj_norm_sq: f64,
     proj_error: f64,
-    sigma_min_sq: f64,
-    sigma_max_sq: f64,
 ) -> (f64, f64) {
     let full_hi = centered_norm_upper(full_norm_sq, d);
     let full_hi_sq = full_hi * full_hi;
@@ -803,44 +650,74 @@ fn residual_interval(
     let proj_norm = proj_norm_sq.max(0.0).sqrt();
     let proj_hi = proj_norm + proj_error;
     let proj_lo = (proj_norm - proj_error).max(0.0);
-    let hi_sq = if sigma_max_sq > 0.0 {
-        (full_hi_sq - proj_lo * proj_lo / sigma_max_sq).max(0.0)
-    } else {
-        full_hi_sq
-    };
-    let lo_sq = if sigma_min_sq > 0.0 {
-        (full_lo_sq - proj_hi * proj_hi / sigma_min_sq).max(0.0)
-    } else {
-        0.0
-    };
+    let hi_sq = (full_hi_sq - proj_lo * proj_lo / SIGMA_MAX_SQ).max(0.0);
+    let lo_sq = (full_lo_sq - proj_hi * proj_hi / SIGMA_MIN_SQ).max(0.0);
     (lo_sq.sqrt(), hi_sq.sqrt().max(lo_sq.sqrt()))
 }
 
-fn make_contractive(proj: &mut [f32], rows: usize, d: usize) {
-    let dot_roundoff = gamma_f64(d.saturating_mul(2).saturating_add(1));
-    let mut max_row_sum = 0.0f64;
-    for i in 0..rows {
-        let mut row_sum = 0.0;
-        for j in 0..rows {
-            let mut dot = 0.0;
-            let mut absolute_sum = 0.0;
-            for (a, b) in proj[i * d..(i + 1) * d]
-                .iter()
-                .zip(&proj[j * d..(j + 1) * d])
-            {
-                let product = (*a as f64) * (*b as f64);
-                dot += product;
-                absolute_sum += product.abs();
+/// `basis` (`rows × d`, f32) re-orthonormalized in f64 by modified
+/// Gram-Schmidt and scaled by `1 - ORTHO_MARGIN`. Returns `None` when even a
+/// second pass leaves the Gram matrix outside `GRAM_MARGIN` (see
+/// `ORTHO_MARGIN`), so callers fall back to the exact scan.
+fn orthonormal_f64(basis: &[f32], rows: usize, d: usize) -> Option<Vec<f64>> {
+    let mut proj: Vec<f64> = basis[..rows * d].iter().map(|v| *v as f64).collect();
+    for _pass in 0..2 {
+        for r in 0..rows {
+            for q in 0..r {
+                let dot: f64 = (0..d).map(|k| proj[r * d + k] * proj[q * d + k]).sum();
+                for k in 0..d {
+                    proj[r * d + k] -= dot * proj[q * d + k];
+                }
             }
-            row_sum += dot.abs() + dot_roundoff * absolute_sum;
+            let norm = (0..d)
+                .map(|k| proj[r * d + k] * proj[r * d + k])
+                .sum::<f64>()
+                .sqrt();
+            if norm.is_nan() || norm <= 0.5 {
+                // Rows come from `top_subspace`, which already made them
+                // orthonormal in f32; a vanishing row here means the basis
+                // is degenerate.
+                return None;
+            }
+            let scale = (1.0 - ORTHO_MARGIN) / norm;
+            for k in 0..d {
+                proj[r * d + k] *= scale;
+            }
         }
-        let sum_roundoff = gamma_f64(rows);
-        max_row_sum = max_row_sum.max(row_sum / (1.0 - sum_roundoff).max(f64::MIN_POSITIVE));
+        if gram_deviation_radius(&proj, rows, d) <= (1.0 - ORTHO_MARGIN).powi(2) * GRAM_MARGIN {
+            return Some(proj);
+        }
     }
-    let scale = CONTRACTION_MARGIN / max_row_sum.max(1.0).sqrt();
-    for value in proj {
-        *value *= scale as f32;
-    }
+    None
+}
+
+/// Gershgorin radius of `P Pᵀ` around `(1 - ORTHO_MARGIN)² · I`: the largest
+/// over rows of `|G_ii - (1 - ORTHO_MARGIN)²| + Σ_{j≠i} |G_ij|`, plus the f64
+/// rounding of computing the `rows` Gram entries of that row. Every
+/// eigenvalue of `P Pᵀ` lies within this radius of the diagonal.
+fn gram_deviation_radius(proj: &[f64], rows: usize, d: usize) -> f64 {
+    let scale_sq = (1.0 - ORTHO_MARGIN).powi(2);
+    let mut gram = vec![0.0f64; rows * rows];
+    dgemm_a_bt(rows, rows, d, 1.0, proj, proj, 0.0, &mut gram);
+    // |P_i| <= 1, so each entry's rounding error is at most gamma_d whatever
+    // the summation order.
+    let entry_error = gamma_f64(d);
+    gram.chunks_exact(rows)
+        .enumerate()
+        .map(|(a, row)| {
+            row.iter()
+                .enumerate()
+                .map(|(b, &g)| {
+                    if a == b {
+                        (g - scale_sq).abs()
+                    } else {
+                        g.abs()
+                    }
+                })
+                .sum::<f64>()
+                + rows as f64 * entry_error
+        })
+        .fold(0.0f64, f64::max)
 }
 
 fn compare_bound_then_index(a: &(f64, u32), b: &(f64, u32)) -> std::cmp::Ordering {
@@ -900,14 +777,14 @@ fn evaluate_candidates(
     evaluations
 }
 
-fn column_mean(data: &[f32], n: usize, d: usize) -> Vec<f32> {
+fn column_mean(data: &[f32], n: usize, d: usize) -> Vec<f64> {
     let mut mean = vec![0.0f64; d];
     for row in data[..n * d].chunks(d) {
         for (m, v) in mean.iter_mut().zip(row) {
             *m += *v as f64;
         }
     }
-    mean.iter().map(|m| (m / n as f64) as f32).collect()
+    mean.iter().map(|m| m / n as f64).collect()
 }
 
 /// Top-`block` principal directions of the centered `n × d` matrix by block
@@ -1088,18 +965,50 @@ mod tests {
         assert!(max_row_sum < 1.0, "Gram row sum is {max_row_sum}");
     }
 
+    /// The constant singular-value bounds rest on the Gershgorin check in
+    /// `orthonormal_f64`; verify the check's own radius on a fitted projection
+    /// and that a degenerate basis is declined rather than bounded.
     #[test]
-    fn auto_mode_keeps_compressible_centroids_and_rejects_noise() {
+    fn projection_gram_matrix_is_within_the_documented_margins() {
+        let (nlist, d) = (512, 96);
+        let cents = low_rank_centroids(nlist, d, 12, 0.3, 91);
+        let rows = rows_like(&cents, nlist, d, 2048, 1.0, 92);
+        let scale_sq = (1.0 - ORTHO_MARGIN).powi(2);
+        for force in [true, false] {
+            let Some(p) = CoarseProjection::train(&cents, nlist, d, force, &rows, 2048) else {
+                continue;
+            };
+            let radius = gram_deviation_radius(&p.proj, p.dp, d);
+            eprintln!(
+                "force={force} d'={} gram deviation radius={radius:.3e}",
+                p.dp
+            );
+            assert!(radius <= scale_sq * GRAM_MARGIN);
+            assert!(scale_sq + radius <= SIGMA_MAX_SQ);
+            assert!(scale_sq - radius >= SIGMA_MIN_SQ);
+        }
+
+        let mut basis = vec![0.0f32; 3 * d];
+        basis[0] = 1.0;
+        basis[d + 1] = 1.0;
+        basis[2 * d] = 1.0; // duplicate of row 0
+        assert!(orthonormal_f64(&basis, 3, d).is_none());
+        assert!(orthonormal_f64(&basis[..2 * d], 2, d).is_some());
+    }
+
+    #[test]
+    fn auto_mode_needs_a_sample() {
         let (nlist, d) = (512, 96);
         let structured = low_rank_centroids(nlist, d, 12, 0.05, 2);
-        let p = CoarseProjection::train(&structured, nlist, d, false, &[], 0).unwrap();
-        assert!(p.dimension() * MAX_AUTO_DP_DIVISOR <= d);
-        assert!(p.explained_variance() >= VARIANCE_TARGET);
+        // Forced mode builds without a sample (widest width); auto needs one
+        // to time the candidates against the exact scan.
+        assert!(CoarseProjection::train(&structured, nlist, d, true, &[], 0).is_some());
+        assert!(CoarseProjection::train(&structured, nlist, d, false, &[], 0).is_none());
 
+        // Forced mode builds even on unstructured centroids (and stays exact:
+        // see `assignment_is_exact_on_unstructured_data`).
         let mut rng = StdRng::seed_from_u64(3);
         let noise: Vec<f32> = (0..nlist * d).map(|_| rng.gen::<f32>()).collect();
-        assert!(CoarseProjection::train(&noise, nlist, d, false, &[], 0).is_none());
-        // Forced mode still builds one (and stays exact).
         assert!(CoarseProjection::train(&noise, nlist, d, true, &[], 0).is_some());
     }
 
@@ -1135,7 +1044,7 @@ mod tests {
         let (nlist, d, n) = (512, 96, 3000);
         let cents = low_rank_centroids(nlist, d, 12, 0.05, 6);
         let rows = rows_like(&cents, nlist, d, n, 0.4, 7);
-        let p = CoarseProjection::train(&cents, nlist, d, false, &[], 0).unwrap();
+        let p = CoarseProjection::train(&cents, nlist, d, true, &rows, 2048).unwrap();
         let (got, evaluations) = p.assign_with_stats(&rows, n, &cents, nlist);
         let exact: Vec<usize> = rows
             .chunks_exact(d)
@@ -1241,7 +1150,8 @@ mod tests {
         let rows = rows_like(&cents, nlist, d, n, 1.0, 42);
         let shift = |v: &[f32]| -> Vec<f32> { v.iter().map(|x| 1e8 + (x - 3.0) * 64.0).collect() };
         let (cents_t, rows_t) = (shift(&cents), shift(&rows));
-        // Forced without calibration: elapsed-time width selection is not the subject here.
+        // Forced and without a sample: both sets get the same (widest) width,
+        // so the comparison is deterministic rather than subject to timing.
         let p = CoarseProjection::train(&cents, nlist, d, true, &[], 0).unwrap();
         let p_t = CoarseProjection::train(&cents_t, nlist, d, true, &[], 0).unwrap();
         let (got, evals) = p.assign_with_stats(&rows, n, &cents, nlist);
@@ -1271,6 +1181,53 @@ mod tests {
             evals_t <= evals * 2,
             "translated data pruned much worse: {evals_t} vs {evals} checks"
         );
+    }
+
+    /// Tight clusters with large norms: the f32 rounding of the projected
+    /// GEMM is comparable to the nearest distance, so any bound without an
+    /// explicit error term mis-assigns a third of the rows here.
+    #[test]
+    fn tight_large_norm_clusters_stay_exact() {
+        let (nlist, d, n) = (512, 96, 20000);
+        let mut rng = StdRng::seed_from_u64(77);
+        let mut cents = low_rank_centroids(nlist, d, 8, 0.0, 78);
+        for v in cents.iter_mut() {
+            *v = (*v - 3.0) * 20.0 + 50.0;
+        }
+        for c in (1..nlist).step_by(2) {
+            for j in 0..d {
+                cents[c * d + j] = cents[(c - 1) * d + j] + (rng.gen::<f32>() - 0.5) * 0.004;
+            }
+        }
+        let rows: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let c = (i * 7919) % nlist;
+                (0..d)
+                    .map(|j| cents[c * d + j] + (rng.gen::<f32>() - 0.5) * 0.004)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let p = CoarseProjection::train(&cents, nlist, d, true, &rows, 2048).unwrap();
+        let got = p.assign(&rows, n, &cents, nlist);
+        for i in 0..n {
+            let x = &rows[i * d..(i + 1) * d];
+            let dist = |c: usize| -> f64 {
+                x.iter()
+                    .zip(&cents[c * d..(c + 1) * d])
+                    .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+                    .sum()
+            };
+            let (best_d, best_c) = (0..nlist)
+                .map(|c| (dist(c), c))
+                .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+                .unwrap();
+            assert!(
+                got[i] == best_c || (dist(got[i]) - best_d) <= 1e-9 * best_d,
+                "row {i}: assigned {} at {} vs nearest {best_c} at {best_d}",
+                got[i],
+                dist(got[i])
+            );
+        }
     }
 
     #[test]
