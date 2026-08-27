@@ -21,7 +21,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
-/// Cap aggregate concurrent ip_matrix scratch to ~16MB (4M f32 elements).
+/// Cap aggregate concurrent assignment scratch to ~16MB (4M f32 elements).
 const MAX_MATRIX_ELEMS: usize = 4 * 1024 * 1024;
 const MIN_BLOCK_ROWS: usize = 32;
 const MIN_BLOCK_FLOPS: usize = 4_000_000;
@@ -37,8 +37,16 @@ fn assert_data_shape(data: &[f32], n: usize, d: usize) {
     assert_eq!(data.len(), expected, "data length does not match n * d");
 }
 
-pub(crate) fn assignment_block_plan(n: usize, d: usize, k: usize, threads: usize) -> (usize, bool) {
-    let max_rows = (MAX_MATRIX_ELEMS / k.max(1)).max(1);
+pub(crate) fn assignment_block_plan(
+    n: usize,
+    d: usize,
+    k: usize,
+    threads: usize,
+    fixed_scratch: usize,
+    row_scratch: usize,
+) -> (usize, bool) {
+    let row_elems = k.max(1).saturating_add(row_scratch);
+    let max_rows = (MAX_MATRIX_ELEMS.saturating_sub(fixed_scratch) / row_elems).max(1);
     if threads <= 1 {
         return (max_rows, false);
     }
@@ -47,7 +55,13 @@ pub(crate) fn assignment_block_plan(n: usize, d: usize, k: usize, threads: usize
     let min_rows = MIN_BLOCK_ROWS
         .max(MIN_BLOCK_FLOPS.div_ceil(row_flops))
         .min(max_rows);
-    let budget_rows = (MAX_MATRIX_ELEMS / threads / k.max(1)).max(1).min(max_rows);
+    let worker_budget = MAX_MATRIX_ELEMS / threads;
+    if fixed_scratch >= worker_budget {
+        return (max_rows, false);
+    }
+    let budget_rows = ((worker_budget - fixed_scratch) / row_elems)
+        .max(1)
+        .min(max_rows);
     if budget_rows < min_rows {
         return (budget_rows, false);
     }
@@ -447,7 +461,7 @@ fn assign_clusters_fast(
         .collect();
 
     let max_rows = (MAX_MATRIX_ELEMS / k.max(1)).max(1);
-    let (block_rows, parallel) = assignment_block_plan(n, d, k, rayon::current_num_threads());
+    let (block_rows, parallel) = assignment_block_plan(n, d, k, rayon::current_num_threads(), 0, 0);
     if n <= block_rows {
         return assign_block(data, n, d, centroids, k, &c_norms, assignments, &mut []);
     } else if !parallel && block_rows == max_rows {
@@ -705,16 +719,10 @@ pub(crate) fn find_nearest_batch(
     k: usize,
     d: usize,
 ) -> Vec<usize> {
-    if n == 0 {
-        return Vec::new();
-    }
-    if n == 1 {
-        return vec![find_nearest(&data[..d], centroids, k, d)];
-    }
-
-    let mut assignments = vec![0usize; n];
-    assign_clusters_fast(data, n, d, centroids, k, &mut assignments, 0.0);
-    assignments
+    (0..n)
+        .into_par_iter()
+        .map(|i| find_nearest(&data[i * d..(i + 1) * d], centroids, k, d))
+        .collect()
 }
 
 pub fn find_topk(
@@ -737,7 +745,7 @@ pub fn find_topk(
     (indices, distances)
 }
 
-/// Batch find top-nprobe nearest centroids for multiple queries using sgemm.
+/// Batch find top-nprobe nearest centroids for multiple queries.
 /// Returns (all_indices, all_distances) each of length nq * nprobe.
 pub fn find_topk_batch(
     queries: &[f32],
@@ -747,10 +755,10 @@ pub fn find_topk_batch(
     d: usize,
     nprobe: usize,
 ) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
-    let centroid_norms = (0..k)
-        .map(|c| fvec_norm_l2sqr(&centroids[c * d..(c + 1) * d]))
-        .collect::<Vec<_>>();
-    find_topk_batch_with_centroid_norms(queries, nq, centroids, &centroid_norms, k, d, nprobe)
+    (0..nq)
+        .into_par_iter()
+        .map(|qi| find_topk(&queries[qi * d..(qi + 1) * d], centroids, k, d, nprobe))
+        .unzip()
 }
 
 pub(crate) fn find_topk_batch_with_centroid_norms(
@@ -763,43 +771,7 @@ pub(crate) fn find_topk_batch_with_centroid_norms(
     nprobe: usize,
 ) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
     debug_assert_eq!(centroid_norms.len(), k);
-    let nprobe = nprobe.min(k);
-    if nprobe == 0 {
-        return (vec![Vec::new(); nq], vec![Vec::new(); nq]);
-    }
-
-    if nq == 1 {
-        let (indices, distances) = find_topk(&queries[..d], centroids, k, d, nprobe);
-        return (vec![indices], vec![distances]);
-    }
-
-    // Precompute norms
-    let q_norms: Vec<f32> = (0..nq)
-        .map(|i| fvec_norm_l2sqr(&queries[i * d..(i + 1) * d]))
-        .collect();
-    // Batch inner products: ip[nq × k] = queries[nq × d] · centroids[k × d]^T
-    let mut ip_matrix = vec![0.0f32; nq * k];
-    sgemm_a_bt(nq, k, d, 1.0, queries, centroids, 0.0, &mut ip_matrix);
-
-    // Extract top-nprobe per query
-    let mut all_indices = Vec::with_capacity(nq);
-    let mut all_distances = Vec::with_capacity(nq);
-
-    for qi in 0..nq {
-        let row = qi * k;
-        let mut dists: Vec<(f32, usize)> = (0..k)
-            .map(|c| {
-                let dist = q_norms[qi] + centroid_norms[c] - 2.0 * ip_matrix[row + c];
-                (dist.max(0.0), c)
-            })
-            .collect();
-        select_topk_prefix(&mut dists, nprobe);
-
-        all_indices.push(dists[..nprobe].iter().map(|&(_, i)| i).collect());
-        all_distances.push(dists[..nprobe].iter().map(|&(d, _)| d).collect());
-    }
-
-    (all_indices, all_distances)
+    find_topk_batch(queries, nq, centroids, k, d, nprobe)
 }
 
 fn select_topk_prefix(dists: &mut [(f32, usize)], nprobe: usize) {
@@ -1114,20 +1086,25 @@ mod tests {
 
     #[test]
     fn test_parallel_assignment_respects_aggregate_scratch_budget() {
-        let (rows, parallel) = assignment_block_plan(262_144, 768, 1024, 16);
+        let (rows, parallel) = assignment_block_plan(262_144, 768, 1024, 16, 0, 0);
         assert!(parallel);
         assert_eq!(rows, 256);
         assert!(rows * 1024 * 16 <= MAX_MATRIX_ELEMS);
 
-        let (rows, parallel) = assignment_block_plan(2_000_000, 1, 2, 16);
+        let (rows, parallel) = assignment_block_plan(2_000_000, 1, 2, 16, 0, 0);
         assert!(!parallel);
         assert_eq!(rows, 131_072);
         assert!(rows * 2 * 16 <= MAX_MATRIX_ELEMS);
 
-        let (rows, parallel) = assignment_block_plan(100_000, 32, 4096, 32);
+        let (rows, parallel) = assignment_block_plan(100_000, 32, 4096, 32, 0, 0);
         assert!(parallel);
         assert_eq!(rows, 32);
         assert!(rows * 4096 * 32 <= MAX_MATRIX_ELEMS);
+
+        let (rows, parallel) = assignment_block_plan(100_000, 32, 4096, 32, 4096 * 6, 0);
+        assert!(!parallel);
+        assert_eq!(rows, 26);
+        assert!(rows * 4096 + 4096 * 6 <= MAX_MATRIX_ELEMS / 32);
     }
 
     #[test]
@@ -1399,6 +1376,20 @@ mod tests {
             .collect();
 
         assert_eq!(batch, scalar);
+    }
+
+    #[test]
+    fn test_batch_distance_matches_scalar_with_large_translation() {
+        let (d, k, n) = (16, 2, 2);
+        let mut centroids = vec![1e8; k * d];
+        centroids[0] += 8.0;
+        let data = vec![1e8; n * d];
+
+        assert_eq!(find_nearest(&data[..d], &centroids, k, d), 1);
+        assert_eq!(find_nearest_batch(&data, n, &centroids, k, d), vec![1; n]);
+        let (indices, distances) = find_topk_batch(&data, n, &centroids, k, d, 1);
+        assert_eq!(indices, vec![vec![1]; n]);
+        assert_eq!(distances, vec![vec![0.0]; n]);
     }
 
     #[test]

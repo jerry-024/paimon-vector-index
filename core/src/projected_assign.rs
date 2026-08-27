@@ -65,6 +65,9 @@ const MAX_AUTO_COST_FRACTION: f64 = 0.85;
 /// Block subspace iterations; the bound stays valid regardless of convergence.
 const SUBSPACE_ITERATIONS: usize = 8;
 const SUBSPACE_SEED: u64 = 0x7a5e_c7ed;
+/// Keep automatic PCA fitting bounded before allocating its work matrices.
+const MAX_AUTO_PCA_BYTES: u128 = 256 * 1024 * 1024;
+const MAX_AUTO_PCA_FLOPS: u128 = 100_000_000_000;
 /// Smallest projection worth a GEMM; also the rounding unit for `d'`.
 const MIN_DP: usize = 8;
 /// Rows per parallel block; the projected score matrix is `rows × nlist`.
@@ -173,6 +176,9 @@ impl CoarseProjection {
             return None;
         }
         let block = block.min(nlist);
+        if !force && !auto_pca_within_budget(nlist, d, block) {
+            return None;
+        }
 
         let mean = column_mean(cents, nlist, d);
         let centered: Vec<f32> = cents
@@ -348,98 +354,118 @@ impl CoarseProjection {
         let dp = self.dp;
         debug_assert_eq!(self.cents_p.len(), nlist * dp);
         let mut out = vec![0usize; n];
-        let (block_rows, _) =
-            crate::kmeans::assignment_block_plan(n, dp, nlist, rayon::current_num_threads());
+        // Per worker: bounds (f64) and candidates (f64 + u32), plus projected
+        // rows and their f64 norms. The planner already counts the score matrix.
+        let fixed_scratch = nlist.saturating_mul(
+            (std::mem::size_of::<f64>() + std::mem::size_of::<(f64, u32)>())
+                .div_ceil(std::mem::size_of::<f32>()),
+        );
+        let row_scratch = dp.saturating_add(2);
+        let (block_rows, parallel) = crate::kmeans::assignment_block_plan(
+            n,
+            dp,
+            nlist,
+            rayon::current_num_threads(),
+            fixed_scratch,
+            row_scratch,
+        );
         let block_rows = block_rows.min(MAX_BLOCK_ROWS);
-        let evaluations = out
-            .par_chunks_mut(block_rows)
-            .enumerate()
-            .map(|(bi, chunk)| {
-                let rows = chunk.len();
-                let row0 = bi * block_rows;
-                let x = &data[row0 * d..(row0 + rows) * d];
-                let (xp, x_norms) = project_rows(x, rows, d, &self.proj, dp, &self.mean);
-                let mut ip = vec![0.0f32; rows * nlist];
-                sgemm_a_bt(rows, nlist, dp, 1.0, &xp, &self.cents_p, 0.0, &mut ip);
+        let assign_block = |(bi, chunk): (usize, &mut [usize])| {
+            let rows = chunk.len();
+            let row0 = bi * block_rows;
+            let x = &data[row0 * d..(row0 + rows) * d];
+            let (xp, x_norms) = project_rows(x, rows, d, &self.proj, dp, &self.mean);
+            let mut ip = vec![0.0f32; rows * nlist];
+            sgemm_a_bt(rows, nlist, dp, 1.0, &xp, &self.cents_p, 0.0, &mut ip);
 
-                let mut bounds = vec![0.0f64; nlist];
-                let mut candidates: Vec<(f64, u32)> = Vec::new();
-                let mut evaluations = 0usize;
-                for i in 0..rows {
-                    let xp_i = &xp[i * dp..(i + 1) * dp];
-                    let x_i = &x[i * d..(i + 1) * d];
-                    self.row_bounds(
-                        xp_i,
-                        x_norms[i],
-                        &ip[i * nlist..(i + 1) * nlist],
-                        &mut bounds,
+            let mut bounds = vec![0.0f64; nlist];
+            let mut candidates: Vec<(f64, u32)> = Vec::new();
+            let mut evaluations = 0usize;
+            for i in 0..rows {
+                let xp_i = &xp[i * dp..(i + 1) * dp];
+                let x_i = &x[i * d..(i + 1) * d];
+                self.row_bounds(
+                    xp_i,
+                    x_norms[i],
+                    &ip[i * nlist..(i + 1) * nlist],
+                    &mut bounds,
+                );
+                let min_bound = bounds.iter().copied().fold(f64::INFINITY, f64::min);
+                let first = bounds.iter().position(|&b| b == min_bound).unwrap_or(0);
+                let mut best = fvec_l2sqr(x_i, &cents[first * d..(first + 1) * d]);
+                let mut best_idx = first;
+                evaluations += 1;
+                let mut best_upper = distance_upper_bound(best, d);
+                candidates.clear();
+                for (c, &bound) in bounds.iter().enumerate() {
+                    if c != first && bound <= best_upper {
+                        candidates.push((bound, c as u32));
+                    }
+                }
+                // Evaluate the `STAGE` smallest bounds first: the best
+                // distance usually drops within a few exact checks, which
+                // prunes most of the rest without sorting them. If it does
+                // not, sort what survives once and finish linearly, so weak
+                // pruning costs O(k log k) rather than one partition per
+                // stage.
+                let mut pending = candidates.as_mut_slice();
+                while !pending.is_empty() {
+                    let stage = STAGE.min(pending.len());
+                    if stage < pending.len() {
+                        pending.select_nth_unstable_by(stage - 1, compare_bound_then_index);
+                    }
+                    let (head, tail) = pending.split_at_mut(stage);
+                    head.sort_unstable_by(compare_bound_then_index);
+                    evaluations += evaluate_candidates(
+                        x_i,
+                        cents,
+                        d,
+                        head,
+                        &mut best,
+                        &mut best_idx,
+                        &mut best_upper,
                     );
-                    let min_bound = bounds.iter().copied().fold(f64::INFINITY, f64::min);
-                    let first = bounds.iter().position(|&b| b == min_bound).unwrap_or(0);
-                    let mut best = fvec_l2sqr(x_i, &cents[first * d..(first + 1) * d]);
-                    let mut best_idx = first;
-                    evaluations += 1;
-                    let mut best_upper = distance_upper_bound(best, d);
-                    candidates.clear();
-                    for (c, &bound) in bounds.iter().enumerate() {
-                        if c != first && bound <= best_upper {
-                            candidates.push((bound, c as u32));
+                    // Everything left has a bound >= the last of `head`.
+                    if head.last().is_some_and(|&(bound, _)| bound > best_upper) {
+                        break;
+                    }
+                    let mut kept = 0;
+                    for j in 0..tail.len() {
+                        if tail[j].0 <= best_upper {
+                            tail.swap(kept, j);
+                            kept += 1;
                         }
                     }
-                    // Evaluate the `STAGE` smallest bounds first: the best
-                    // distance usually drops within a few exact checks, which
-                    // prunes most of the rest without sorting them. If it does
-                    // not, sort what survives once and finish linearly, so weak
-                    // pruning costs O(k log k) rather than one partition per
-                    // stage.
-                    let mut pending = candidates.as_mut_slice();
-                    while !pending.is_empty() {
-                        let stage = STAGE.min(pending.len());
-                        if stage < pending.len() {
-                            pending.select_nth_unstable_by(stage - 1, compare_bound_then_index);
-                        }
-                        let (head, tail) = pending.split_at_mut(stage);
-                        head.sort_unstable_by(compare_bound_then_index);
+                    pending = &mut tail[..kept];
+                    if pending.len() > STAGE * 2 {
+                        pending.sort_unstable_by(compare_bound_then_index);
                         evaluations += evaluate_candidates(
                             x_i,
                             cents,
                             d,
-                            head,
+                            pending,
                             &mut best,
                             &mut best_idx,
                             &mut best_upper,
                         );
-                        // Everything left has a bound >= the last of `head`.
-                        if head.last().is_some_and(|&(bound, _)| bound > best_upper) {
-                            break;
-                        }
-                        let mut kept = 0;
-                        for j in 0..tail.len() {
-                            if tail[j].0 <= best_upper {
-                                tail.swap(kept, j);
-                                kept += 1;
-                            }
-                        }
-                        pending = &mut tail[..kept];
-                        if pending.len() > STAGE * 2 {
-                            pending.sort_unstable_by(compare_bound_then_index);
-                            evaluations += evaluate_candidates(
-                                x_i,
-                                cents,
-                                d,
-                                pending,
-                                &mut best,
-                                &mut best_idx,
-                                &mut best_upper,
-                            );
-                            break;
-                        }
+                        break;
                     }
-                    chunk[i] = best_idx;
                 }
-                evaluations
-            })
-            .sum();
+                chunk[i] = best_idx;
+            }
+            evaluations
+        };
+        let evaluations = if parallel {
+            out.par_chunks_mut(block_rows)
+                .enumerate()
+                .map(assign_block)
+                .sum()
+        } else {
+            out.chunks_mut(block_rows)
+                .enumerate()
+                .map(assign_block)
+                .sum()
+        };
         (out, evaluations)
     }
 
@@ -790,6 +816,34 @@ fn column_mean(data: &[f32], n: usize, d: usize) -> Vec<f64> {
     mean.iter().map(|m| m / n as f64).collect()
 }
 
+fn auto_pca_within_budget(n: usize, d: usize, block: usize) -> bool {
+    let (n, d, block) = (n as u128, d as u128, block as u128);
+    // Conservative peaks from the centered/transposed matrices, projected
+    // blocks, orthonormalization workspace, and Rayleigh-Ritz step.
+    let bytes = n
+        .saturating_mul(d)
+        .saturating_mul(12)
+        .saturating_add(block.saturating_mul(d).saturating_mul(16))
+        .saturating_add(block.saturating_mul(n).saturating_mul(8))
+        .saturating_add(block.saturating_mul(block).saturating_mul(20));
+    let flops = n
+        .saturating_mul(d)
+        .saturating_mul(block)
+        .saturating_mul(34)
+        .saturating_add(
+            block
+                .saturating_mul(block)
+                .saturating_mul(d)
+                .saturating_mul(20),
+        )
+        .saturating_add(
+            n.saturating_mul(block)
+                .saturating_mul(block)
+                .saturating_mul(2),
+        );
+    bytes <= MAX_AUTO_PCA_BYTES && flops <= MAX_AUTO_PCA_FLOPS
+}
+
 /// Top-`block` principal directions of the centered `n × d` matrix by block
 /// subspace iteration with a Rayleigh-Ritz step. Returns the basis as
 /// `block × d` orthonormal rows sorted by decreasing eigenvalue, plus the
@@ -992,6 +1046,13 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(3);
         let noise: Vec<f32> = (0..nlist * d).map(|_| rng.gen::<f32>()).collect();
         assert!(CoarseProjection::train(&noise, nlist, d, true, &[], 0).is_some());
+    }
+
+    #[test]
+    fn auto_pca_budget_rejects_pathological_fit() {
+        assert!(auto_pca_within_budget(4096, 768, 256));
+        assert!(!auto_pca_within_budget(8192, 8192, 2728));
+        assert!(!auto_pca_within_budget(usize::MAX, usize::MAX, usize::MAX));
     }
 
     #[test]
