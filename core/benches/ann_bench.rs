@@ -1248,8 +1248,10 @@ fn read_fvecs(path: &Path) -> io::Result<(usize, Vec<f32>)> {
         }
         reader.read_exact(&mut row)?;
         values.extend(
-            row.chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk"))),
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes)),
         );
     }
     Ok((dimension, values))
@@ -1272,8 +1274,10 @@ fn read_ivecs(path: &Path) -> io::Result<Vec<Vec<i64>>> {
         }
         reader.read_exact(&mut row)?;
         result.push(
-            row.chunks_exact(4)
-                .map(|bytes| i32::from_le_bytes(bytes.try_into().expect("four-byte chunk")) as i64)
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| i32::from_le_bytes(*bytes) as i64)
                 .collect(),
         );
     }

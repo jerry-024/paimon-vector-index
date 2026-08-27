@@ -3414,12 +3414,8 @@ fn metric_distance_from_f32_le_bytes(
     let mut dot = 0.0f32;
     let mut query_norm = 0.0f32;
     let mut vector_norm = 0.0f32;
-    for (&query_value, component) in query.iter().zip(bytes.chunks_exact(size_of::<f32>())) {
-        let value = f32::from_le_bytes(
-            component
-                .try_into()
-                .expect("validated four-byte raw vector component"),
-        );
+    for (&query_value, component) in query.iter().zip(bytes.as_chunks::<4>().0.iter()) {
+        let value = f32::from_le_bytes(*component);
         if !value.is_finite() {
             return Err(invalid_data("DiskANN raw vectors must be finite"));
         }
@@ -3461,13 +3457,9 @@ fn metric_distance_from_f16_le_bytes(
     let mut decoded = [0.0f32; 1024];
     for (slot, component) in decoded[..query.len()]
         .iter_mut()
-        .zip(bytes.chunks_exact(size_of::<u16>()))
+        .zip(bytes.as_chunks::<2>().0.iter())
     {
-        let value = half::f16::from_bits(u16::from_le_bytes(
-            component
-                .try_into()
-                .expect("validated two-byte raw-vector component"),
-        ));
+        let value = half::f16::from_bits(u16::from_le_bytes(*component));
         if !value.is_finite() {
             return Err(invalid_data("DiskANN raw vectors must be finite"));
         }
@@ -3501,13 +3493,9 @@ fn l2_distance_from_f16_le_bytes(query: &[f32], bytes: &[u8]) -> io::Result<f32>
     let mut bits = [0u16; 1024];
     for (slot, component) in bits[..query.len()]
         .iter_mut()
-        .zip(bytes.chunks_exact(size_of::<u16>()))
+        .zip(bytes.as_chunks::<2>().0.iter())
     {
-        *slot = u16::from_le_bytes(
-            component
-                .try_into()
-                .expect("validated two-byte raw-vector component"),
-        );
+        *slot = u16::from_le_bytes(*component);
     }
     let values = bits[..query.len()].reinterpret_cast::<half::f16>();
     if values.iter().any(|value| !value.is_finite()) {
@@ -3584,12 +3572,8 @@ fn l2_distance_from_le_bytes_with_kernel(
 
 fn l2_distance_from_le_bytes_scalar(query: &[f32], bytes: &[u8]) -> io::Result<f32> {
     let mut distance = 0.0f32;
-    for (&query_value, component) in query.iter().zip(bytes.chunks_exact(4)) {
-        let value = f32::from_le_bytes(
-            component
-                .try_into()
-                .expect("validated four-byte raw vector component"),
-        );
+    for (&query_value, component) in query.iter().zip(bytes.as_chunks::<4>().0.iter()) {
+        let value = f32::from_le_bytes(*component);
         if !value.is_finite() {
             return Err(invalid_data("DiskANN raw vectors must be finite"));
         }

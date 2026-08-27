@@ -760,7 +760,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
         self.list_id_bytes_lens = vec![0i32; nlist];
         let offset_table = &metadata[position..];
         let mut actual_total = 0i64;
-        for (i, entry) in offset_table.chunks_exact(16).enumerate() {
+        for (i, entry) in offset_table.as_chunks::<16>().0.iter().enumerate() {
             self.list_offsets[i] = i64::from_le_bytes(entry[0..8].try_into().unwrap());
             let count = i32::from_le_bytes(entry[8..12].try_into().unwrap());
             if count < 0 {

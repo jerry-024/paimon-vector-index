@@ -35,6 +35,12 @@ use std::io;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+const PARALLEL_PREPROCESS_MIN_VALUES: usize = 65_536;
+
+fn should_parallelize_preprocessing(nq: usize, d: usize) -> bool {
+    nq.saturating_mul(d) >= PARALLEL_PREPROCESS_MIN_VALUES
+}
+
 pub trait RowIdFilter: Sync {
     fn contains(&self, id: i64) -> bool;
 }
@@ -67,10 +73,7 @@ pub struct IVFPQIndex {
     pub metric: MetricType,
     pub by_residual: bool,
 
-    /// Coarse centroids (`nlist × d`). Kept public for source compatibility;
-    /// use [`Self::set_quantizer_centroids`] so derived build/search state is
-    /// invalidated correctly.
-    pub quantizer_centroids: Vec<f32>,
+    pub(crate) quantizer_centroids: Vec<f32>,
     pub pq: ProductQuantizer,
     pub opq: Option<OPQMatrix>,
 
@@ -634,17 +637,21 @@ impl IVFPQIndex {
         let d = self.d;
         let processed = match self.metric {
             MetricType::Cosine => {
-                // Copy and normalize per chunk in parallel: a serial
-                // `to_vec()` of a 32k × 768 batch plus its first-touch page
-                // faults cost more than the normalization itself.
                 let mut normalized = vec![0.0f32; nq * d];
-                normalized
-                    .par_chunks_exact_mut(d)
-                    .zip(queries[..nq * d].par_chunks_exact(d))
-                    .for_each(|(dst, src)| {
-                        dst.copy_from_slice(src);
-                        fvec_normalize(dst);
+                if should_parallelize_preprocessing(nq, d) {
+                    normalized
+                        .par_chunks_exact_mut(d)
+                        .zip(queries[..nq * d].par_chunks_exact(d))
+                        .for_each(|(dst, src)| {
+                            dst.copy_from_slice(src);
+                            fvec_normalize(dst);
+                        });
+                } else {
+                    normalized.copy_from_slice(&queries[..nq * d]);
+                    normalized.chunks_exact_mut(d).for_each(|vector| {
+                        fvec_normalize(vector);
                     });
+                }
                 Cow::Owned(normalized)
             }
             MetricType::L2 | MetricType::InnerProduct => Cow::Borrowed(&queries[..nq * d]),
@@ -1371,20 +1378,14 @@ fn scan_codes_transposed_with_scratch(
 fn transposed_column_init(dists: &mut [f32], column: &[u8], table: &[f32], dis0: f32) {
     debug_assert_eq!(dists.len(), column.len());
     if let Ok(table) = <&[f32; 256]>::try_from(table) {
-        let mut dist_chunks = dists.chunks_exact_mut(8);
-        let mut code_chunks = column.chunks_exact(8);
-        for (dist8, code8) in (&mut dist_chunks).zip(&mut code_chunks) {
-            let dist8: &mut [f32; 8] = dist8.try_into().unwrap();
-            let code8: &[u8; 8] = code8.try_into().unwrap();
+        let (dist_chunks, dist_remainder) = dists.as_chunks_mut::<8>();
+        let (code_chunks, code_remainder) = column.as_chunks::<8>();
+        for (dist8, code8) in dist_chunks.iter_mut().zip(code_chunks) {
             for i in 0..8 {
                 dist8[i] = dis0 + table[code8[i] as usize];
             }
         }
-        for (dist, &code) in dist_chunks
-            .into_remainder()
-            .iter_mut()
-            .zip(code_chunks.remainder())
-        {
+        for (dist, &code) in dist_remainder.iter_mut().zip(code_remainder) {
             *dist = dis0 + table[code as usize];
         }
     } else {
@@ -1398,20 +1399,14 @@ fn transposed_column_init(dists: &mut [f32], column: &[u8], table: &[f32], dis0:
 fn transposed_column_add(dists: &mut [f32], column: &[u8], table: &[f32]) {
     debug_assert_eq!(dists.len(), column.len());
     if let Ok(table) = <&[f32; 256]>::try_from(table) {
-        let mut dist_chunks = dists.chunks_exact_mut(8);
-        let mut code_chunks = column.chunks_exact(8);
-        for (dist8, code8) in (&mut dist_chunks).zip(&mut code_chunks) {
-            let dist8: &mut [f32; 8] = dist8.try_into().unwrap();
-            let code8: &[u8; 8] = code8.try_into().unwrap();
+        let (dist_chunks, dist_remainder) = dists.as_chunks_mut::<8>();
+        let (code_chunks, code_remainder) = column.as_chunks::<8>();
+        for (dist8, code8) in dist_chunks.iter_mut().zip(code_chunks) {
             for i in 0..8 {
                 dist8[i] += table[code8[i] as usize];
             }
         }
-        for (dist, &code) in dist_chunks
-            .into_remainder()
-            .iter_mut()
-            .zip(code_chunks.remainder())
-        {
+        for (dist, &code) in dist_remainder.iter_mut().zip(code_remainder) {
             *dist += table[code as usize];
         }
     } else {
@@ -3849,6 +3844,8 @@ mod tests {
 
         let cosine = IVFPQIndex::new(2, 1, 1, MetricType::Cosine, false);
         assert!(matches!(cosine.preprocess_queries(&data, 2), Cow::Owned(_)));
+        assert!(!should_parallelize_preprocessing(85, 768));
+        assert!(should_parallelize_preprocessing(86, 768));
     }
 
     #[test]

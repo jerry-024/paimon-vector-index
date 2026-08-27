@@ -405,9 +405,13 @@ pub(crate) fn decode_adjacency_list(
             let encoded = bytes
                 .get(..encoded_len)
                 .ok_or_else(|| invalid_data("DiskANN raw adjacency list is truncated"))?;
-            neighbors.extend(encoded.chunks_exact(4).map(|value| {
-                u32::from_le_bytes(value.try_into().expect("fixed adjacency neighbor"))
-            }));
+            neighbors.extend(
+                encoded
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|value| u32::from_le_bytes(*value)),
+            );
             Ok(encoded_len)
         }
     }
@@ -1334,9 +1338,13 @@ fn decode_row_id_section(bytes: &[u8], expected_count: usize) -> io::Result<RowI
             row_ids
                 .try_reserve_exact(header.count)
                 .map_err(|_| invalid_data("DiskANN raw row-ID allocation failed"))?;
-            row_ids.extend(payload.chunks_exact(8).map(|value| {
-                i64::from_le_bytes(value.try_into().expect("validated eight-byte row ID"))
-            }));
+            row_ids.extend(
+                payload
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|value| i64::from_le_bytes(*value)),
+            );
             RowIdStorage::Raw(row_ids)
         }
         ROW_ID_ENCODING_FOR_BITPACK => {
@@ -1879,15 +1887,16 @@ fn validate_adjacency_page_payload(
 
 fn validate_raw_vector_bytes(vector: &[u8], encoding: DiskAnnRawVectorEncoding) -> io::Result<()> {
     let has_non_finite = match encoding {
-        DiskAnnRawVectorEncoding::F32 => vector.chunks_exact(size_of::<f32>()).any(|value| {
-            !f32::from_le_bytes(value.try_into().expect("four-byte vector component")).is_finite()
-        }),
-        DiskAnnRawVectorEncoding::F16 => vector.chunks_exact(size_of::<u16>()).any(|value| {
-            !half::f16::from_bits(u16::from_le_bytes(
-                value.try_into().expect("two-byte vector component"),
-            ))
-            .is_finite()
-        }),
+        DiskAnnRawVectorEncoding::F32 => vector
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|value| !f32::from_le_bytes(*value).is_finite()),
+        DiskAnnRawVectorEncoding::F16 => vector
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .any(|value| !half::f16::from_bits(u16::from_le_bytes(*value)).is_finite()),
     };
     if !vector.len().is_multiple_of(encoding.element_size()) || has_non_finite {
         return Err(invalid_data(
@@ -2846,35 +2855,35 @@ fn decode_adjacency_index(bytes: &[u8], header: &DiskAnnHeader) -> io::Result<Ad
     block_offsets
         .try_reserve_exact(block_count)
         .map_err(|_| invalid_data("DiskANN adjacency block-offset allocation failed"))?;
-    block_offsets.extend(bytes[..relative_offset].chunks_exact(8).map(|value| {
-        u64::from_le_bytes(value.try_into().expect("validated eight-byte block offset"))
-    }));
+    block_offsets.extend(
+        bytes[..relative_offset]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|value| u64::from_le_bytes(*value)),
+    );
     let mut relative_offsets = Vec::new();
     relative_offsets
         .try_reserve_exact(locator_count)
         .map_err(|_| invalid_data("DiskANN adjacency relative-offset allocation failed"))?;
     relative_offsets.extend(
         bytes[relative_offset..metadata_offset]
-            .chunks_exact(2)
-            .map(|value| {
-                u16::from_le_bytes(
-                    value
-                        .try_into()
-                        .expect("validated two-byte relative offset"),
-                )
-            }),
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|value| u16::from_le_bytes(*value)),
     );
     let mut degree_and_flags = Vec::new();
     degree_and_flags
         .try_reserve_exact(locator_count)
         .map_err(|_| invalid_data("DiskANN adjacency metadata allocation failed"))?;
-    degree_and_flags.extend(bytes[metadata_offset..].chunks_exact(2).map(|value| {
-        u16::from_le_bytes(
-            value
-                .try_into()
-                .expect("validated two-byte locator metadata"),
-        )
-    }));
+    degree_and_flags.extend(
+        bytes[metadata_offset..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|value| u16::from_le_bytes(*value)),
+    );
     let index = AdjacencyIndex {
         block_offsets: block_offsets.into_boxed_slice(),
         relative_offsets: relative_offsets.into_boxed_slice(),
@@ -3037,10 +3046,12 @@ fn decode_pq_codebook(bytes: &[u8], header: &DiskAnnHeader) -> io::Result<Produc
     chunk_offsets
         .try_reserve_exact(offset_count)
         .map_err(|_| invalid_data("DiskANN PQ chunk-offset allocation failed"))?;
-    for encoded in bytes[PQ_CODEBOOK_HEADER_SIZE..centroids_offset].chunks_exact(4) {
-        chunk_offsets.push(u32::from_le_bytes(
-            encoded.try_into().expect("four-byte PQ chunk offset"),
-        ) as usize);
+    for encoded in bytes[PQ_CODEBOOK_HEADER_SIZE..centroids_offset]
+        .as_chunks::<4>()
+        .0
+        .iter()
+    {
+        chunk_offsets.push(u32::from_le_bytes(*encoded) as usize);
     }
     let mut pq = ProductQuantizer::try_with_chunk_offsets(
         header.dimension as usize,
@@ -3052,9 +3063,8 @@ fn decode_pq_codebook(bytes: &[u8], header: &DiskAnnHeader) -> io::Result<Produc
     centroids
         .try_reserve_exact(header.dimension as usize * pq.ksub)
         .map_err(|_| invalid_data("DiskANN PQ centroid allocation failed"))?;
-    for encoded in bytes[centroids_offset..].chunks_exact(4) {
-        let value =
-            f32::from_le_bytes(encoded.try_into().expect("validated four-byte PQ centroid"));
+    for encoded in bytes[centroids_offset..].as_chunks::<4>().0.iter() {
+        let value = f32::from_le_bytes(*encoded);
         if !value.is_finite() {
             return Err(invalid_data("DiskANN PQ centroids must be finite"));
         }
@@ -3080,9 +3090,13 @@ fn decode_row_id_section_owned(
             row_ids
                 .try_reserve_exact(header.count)
                 .map_err(|_| invalid_data("DiskANN raw row-ID allocation failed"))?;
-            row_ids.extend(payload.chunks_exact(8).map(|value| {
-                i64::from_le_bytes(value.try_into().expect("validated eight-byte row ID"))
-            }));
+            row_ids.extend(
+                payload
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|value| i64::from_le_bytes(*value)),
+            );
             RowIdStorage::Raw(row_ids)
         }
         ROW_ID_ENCODING_FOR_BITPACK => RowIdStorage::ForBitPacked {
@@ -3125,9 +3139,11 @@ fn read_u32_section<R: SeekRead>(
             .pread(&mut [ReadRequest::new(section.offset + loaded as u64, chunk)])
             .map_err(|error| map_read_error(error, name))?;
         values.extend(
-            chunk.chunks_exact(4).map(|bytes| {
-                u32::from_le_bytes(bytes.try_into().expect("validated four-byte value"))
-            }),
+            chunk
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| u32::from_le_bytes(*bytes)),
         );
         loaded += chunk_len;
     }
@@ -4591,8 +4607,10 @@ mod tests {
         .unwrap();
         let order = bytes[header.sections.row_id_order.offset as usize
             ..section_end(header.sections.row_id_order).unwrap() as usize]
-            .chunks_exact(4)
-            .map(|value| u32::from_le_bytes(value.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|value| u32::from_le_bytes(*value))
             .collect::<Vec<_>>();
 
         validate_row_id_order(&row_ids, &order).unwrap();
