@@ -1038,8 +1038,8 @@ fn gamma_f32(operations: usize) -> f64 {
 /// Direct distances of four centroids at a time (same accumulation order as
 /// `fvec_l2sqr`, so the result equals `find_topk`'s bit for bit).
 fn direct_distances(x: &[f32], centroids: &[f32], d: usize, slots: &mut [(f32, usize)]) {
-    let mut chunks = slots.chunks_exact_mut(4);
-    for group in &mut chunks {
+    let (chunks, remainder) = slots.as_chunks_mut::<4>();
+    for group in chunks {
         let dists = fvec_l2sqr_four(
             x,
             &centroids[group[0].1 * d..(group[0].1 + 1) * d],
@@ -1051,7 +1051,7 @@ fn direct_distances(x: &[f32], centroids: &[f32], d: usize, slots: &mut [(f32, u
             slot.0 = dist;
         }
     }
-    for slot in chunks.into_remainder() {
+    for slot in remainder {
         slot.0 = fvec_l2sqr(x, &centroids[slot.1 * d..(slot.1 + 1) * d]);
     }
 }
