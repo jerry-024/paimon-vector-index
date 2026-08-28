@@ -28,6 +28,7 @@ const MIN_BLOCK_ROWS: usize = 32;
 const MIN_BLOCK_FLOPS: usize = 4_000_000;
 const TARGET_BLOCKS: usize = 64;
 const DIRECT_ROWS_PER_THREAD: usize = 8;
+const MIN_GEMM_DIM: usize = 32;
 const CENTROID_TILE_COLS: usize = 4096;
 
 #[derive(Clone, Copy)]
@@ -88,8 +89,8 @@ fn assert_data_shape(data: &[f32], n: usize, d: usize) {
     assert_eq!(data.len(), expected, "data length does not match n * d");
 }
 
-fn use_direct_batch(rows: usize, threads: usize) -> bool {
-    rows < DIRECT_ROWS_PER_THREAD.saturating_mul(threads.max(1))
+fn use_direct_batch(rows: usize, d: usize, threads: usize) -> bool {
+    d < MIN_GEMM_DIM || rows < DIRECT_ROWS_PER_THREAD.saturating_mul(threads.max(1))
 }
 
 fn use_parallel_direct_topk(nq: usize, k: usize, nprobe: usize, threads: usize) -> bool {
@@ -128,7 +129,15 @@ fn topk_worker_scratch(k: usize, nprobe: usize) -> usize {
 
 fn centroid_tile_size(k: usize, d: usize, nprobe: usize, threads: usize) -> Option<usize> {
     let worker_budget = MAX_MATRIX_ELEMS / threads.max(1);
-    if nprobe <= 1 || nprobe >= k || topk_worker_scratch(k, nprobe) < worker_budget {
+    if nprobe == 0 || nprobe >= k {
+        return None;
+    }
+    let needs_tiling = if nprobe == 1 {
+        k.saturating_mul(2) >= worker_budget
+    } else {
+        topk_worker_scratch(k, nprobe) >= worker_budget
+    };
+    if !needs_tiling {
         return None;
     }
     let heap_scratch = nprobe.saturating_mul(topk_tuple_elems()).saturating_mul(2);
@@ -838,7 +847,7 @@ pub(crate) fn find_nearest_batch(
     if n == 0 || k == 0 {
         return Vec::new();
     }
-    if use_direct_batch(n, rayon::current_num_threads()) || d == 0 {
+    if use_direct_batch(n, d, rayon::current_num_threads()) {
         return (0..n)
             .into_par_iter()
             .map(|i| find_nearest(&data[i * d..(i + 1) * d], centroids, k, d))
@@ -1280,7 +1289,7 @@ pub fn find_topk_batch(
     d: usize,
     nprobe: usize,
 ) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
-    if use_direct_batch(nq, rayon::current_num_threads()) || d == 0 {
+    if use_direct_batch(nq, d, rayon::current_num_threads()) {
         return find_topk_batch_direct(queries, nq, centroids, k, d, nprobe);
     }
     let centroid_norms = (0..k)
@@ -1303,7 +1312,7 @@ pub(crate) fn find_topk_batch_with_centroid_norms(
     if nprobe == 0 {
         return (vec![Vec::new(); nq], vec![Vec::new(); nq]);
     }
-    if use_direct_batch(nq, rayon::current_num_threads()) || d == 0 {
+    if use_direct_batch(nq, d, rayon::current_num_threads()) {
         return find_topk_batch_direct(queries, nq, centroids, k, d, nprobe);
     }
     let mut out: Vec<(Vec<usize>, Vec<f32>)> = vec![(Vec::new(), Vec::new()); nq];
@@ -1956,26 +1965,73 @@ mod tests {
     }
 
     #[test]
-    fn test_small_batch_direct_cutoff() {
-        assert!(use_direct_batch(31, 4));
-        assert!(!use_direct_batch(32, 4));
+    fn test_tiled_certified_top1_matches_direct() {
+        let (n, k, d, nprobe) = (4, 65_537, 2, 1);
+        let centroids = deterministic_data(k, d, 47);
+        let queries = deterministic_data(n, d, 53);
+        let centroid_norms: Vec<_> = centroids.chunks(d).map(fvec_norm_l2sqr).collect();
+        let mut actual = vec![(Vec::new(), Vec::new()); n];
 
-        let centroids = [-1.0, 1.0];
-        let centroid_norms = [1.0, 1.0];
-        let queries = vec![10.0; 8];
+        pool(32).install(|| {
+            assert_eq!(centroid_tile_size(k, d, nprobe, 32), Some(4096));
+            certified_topk_blocks(
+                &queries,
+                n,
+                &centroids,
+                &centroid_norms,
+                k,
+                d,
+                nprobe,
+                &mut actual,
+                |slot, top| {
+                    slot.0.extend(top.iter().map(|&(_, index)| index));
+                    slot.1.extend(top.iter().map(|&(distance, _)| distance));
+                },
+            );
+        });
+
+        for row in 0..n {
+            let expected = find_topk(&queries[row * d..(row + 1) * d], &centroids, k, d, nprobe);
+            assert_eq!(actual[row].0, expected.0, "row {row} indices differ");
+            assert_eq!(
+                actual[row].1[0].to_bits(),
+                expected.1[0].to_bits(),
+                "row {row} distance differs"
+            );
+        }
+    }
+
+    #[test]
+    fn test_small_batch_direct_cutoff() {
+        assert!(use_direct_batch(31, 32, 4));
+        assert!(!use_direct_batch(32, 32, 4));
+        assert!(use_direct_batch(32, 8, 4));
+
+        let d = 32;
+        let centroids = [-1.0f32; 64];
+        let centroid_norms = [32.0, 32.0];
+        let queries = vec![10.0; 8 * d];
         let (direct_rows, blocked_rows) = pool(1).install(|| {
             CERTIFIED_SGEMM_ROWS.with(|count| count.set(Some(0)));
             find_topk_batch_with_centroid_norms(
-                &queries[..7],
+                &queries[..7 * d],
                 7,
                 &centroids,
                 &centroid_norms,
                 2,
-                1,
+                d,
                 1,
             );
             let direct_rows = CERTIFIED_SGEMM_ROWS.with(|count| count.get().unwrap());
-            find_topk_batch_with_centroid_norms(&queries, 8, &centroids, &centroid_norms, 2, 1, 1);
+            find_topk_batch_with_centroid_norms(
+                &queries,
+                8,
+                &centroids,
+                &centroid_norms,
+                2,
+                d,
+                1,
+            );
             let blocked_rows = CERTIFIED_SGEMM_ROWS.with(|count| count.replace(None).unwrap());
             (direct_rows, blocked_rows)
         });
