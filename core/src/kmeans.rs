@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::blas::sgemm_a_bt;
-use crate::distance::{fvec_l2sqr, fvec_norm_l2sqr};
+use crate::distance::{fvec_l2sqr, fvec_l2sqr_four, fvec_norm_l2sqr};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -702,7 +702,23 @@ fn update_centroids(
 pub fn find_nearest(point: &[f32], centroids: &[f32], k: usize, d: usize) -> usize {
     let mut best = 0;
     let mut best_dist = f32::MAX;
-    for c in 0..k {
+    let four_end = k / 4 * 4;
+    for c in (0..four_end).step_by(4) {
+        let distances = fvec_l2sqr_four(
+            point,
+            &centroids[c * d..(c + 1) * d],
+            &centroids[(c + 1) * d..(c + 2) * d],
+            &centroids[(c + 2) * d..(c + 3) * d],
+            &centroids[(c + 3) * d..(c + 4) * d],
+        );
+        for (offset, dist) in distances.into_iter().enumerate() {
+            if dist < best_dist {
+                best_dist = dist;
+                best = c + offset;
+            }
+        }
+    }
+    for c in four_end..k {
         let dist = fvec_l2sqr(point, &centroids[c * d..(c + 1) * d]);
         if dist < best_dist {
             best_dist = dist;
@@ -736,9 +752,24 @@ pub fn find_topk(
     if nprobe == 0 {
         return (Vec::new(), Vec::new());
     }
-    let mut dists: Vec<(f32, usize)> = (0..k)
-        .map(|c| (fvec_l2sqr(point, &centroids[c * d..(c + 1) * d]), c))
-        .collect();
+    let mut dists = Vec::with_capacity(k);
+    let four_end = k / 4 * 4;
+    for c in (0..four_end).step_by(4) {
+        let distances = fvec_l2sqr_four(
+            point,
+            &centroids[c * d..(c + 1) * d],
+            &centroids[(c + 1) * d..(c + 2) * d],
+            &centroids[(c + 2) * d..(c + 3) * d],
+            &centroids[(c + 3) * d..(c + 4) * d],
+        );
+        dists.extend(
+            distances
+                .into_iter()
+                .enumerate()
+                .map(|(offset, distance)| (distance, c + offset)),
+        );
+    }
+    dists.extend((four_end..k).map(|c| (fvec_l2sqr(point, &centroids[c * d..(c + 1) * d]), c)));
     select_topk_prefix(&mut dists, nprobe);
     let indices: Vec<usize> = dists[..nprobe].iter().map(|&(_, i)| i).collect();
     let distances: Vec<f32> = dists[..nprobe].iter().map(|&(d, _)| d).collect();
