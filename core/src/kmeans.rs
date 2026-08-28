@@ -27,6 +27,21 @@ const MIN_BLOCK_ROWS: usize = 32;
 const MIN_BLOCK_FLOPS: usize = 4_000_000;
 const TARGET_BLOCKS: usize = 64;
 
+#[cfg(test)]
+std::thread_local! {
+    static CERTIFIED_SGEMM_ROWS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn record_certified_sgemm_rows(rows: usize) {
+    CERTIFIED_SGEMM_ROWS.with(|count| {
+        if let Some(current) = count.get() {
+            count.set(Some(current + rows));
+        }
+    });
+}
+
 fn checked_matrix_len(name: &str, rows: usize, cols: usize) -> usize {
     rows.checked_mul(cols)
         .unwrap_or_else(|| panic!("{name} shape overflows usize"))
@@ -735,10 +750,176 @@ pub(crate) fn find_nearest_batch(
     k: usize,
     d: usize,
 ) -> Vec<usize> {
-    (0..n)
-        .into_par_iter()
-        .map(|i| find_nearest(&data[i * d..(i + 1) * d], centroids, k, d))
-        .collect()
+    if n == 0 || k == 0 {
+        return Vec::new();
+    }
+    if n == 1 || d == 0 {
+        return (0..n)
+            .map(|i| find_nearest(&data[i * d..(i + 1) * d], centroids, k, d))
+            .collect();
+    }
+    let c_norms: Vec<f32> = (0..k)
+        .map(|c| fvec_norm_l2sqr(&centroids[c * d..(c + 1) * d]))
+        .collect();
+    let mut out = vec![0usize; n];
+    certified_topk_blocks(
+        data,
+        n,
+        centroids,
+        &c_norms,
+        k,
+        d,
+        1,
+        &mut out,
+        |slot, top| *slot = top[0].1,
+    );
+    out
+}
+
+/// Batch coarse search with the contract of `find_topk` (direct `fvec_l2sqr`
+/// distances, ties by centroid index) at the cost of blocked SGEMM.
+///
+/// Rows are processed in SGEMM blocks sized by `assignment_block_plan`, in
+/// parallel when the plan allows. Before the GEMM every row is screened: a
+/// row whose norm or centroid norms are not finite, or whose GEMM error band
+/// `2·E_gemm` is not smaller than its direct distance to the centroid mean
+/// (data translated far from the origin, where `|x|² + |c|² - 2x·c` cancels
+/// catastrophically), is scanned directly instead. A block with no other rows
+/// skips the GEMM entirely. Each remaining row goes through
+/// `certified_topk_row`; `emit` receives every row's top list in its slot.
+#[allow(clippy::too_many_arguments)]
+fn certified_topk_blocks<T: Send>(
+    data: &[f32],
+    n: usize,
+    centroids: &[f32],
+    c_norms: &[f32],
+    k: usize,
+    d: usize,
+    nprobe: usize,
+    out: &mut [T],
+    emit: impl Fn(&mut T, &[(f32, usize)]) + Sync,
+) {
+    let c_max = centroid_norm_upper(c_norms, d);
+    let mut mean = vec![0.0f64; d];
+    for row in centroids[..k * d].chunks_exact(d) {
+        for (m, v) in mean.iter_mut().zip(row) {
+            *m += *v as f64;
+        }
+    }
+    let mean: Vec<f32> = mean.iter().map(|m| (m / k as f64) as f32).collect();
+    let (block_rows, parallel) = assignment_block_plan(n, d, k, rayon::current_num_threads(), 0, 0);
+    let block = |(b, chunk): (usize, &mut [T])| {
+        let start = b * block_rows;
+        let rows = chunk.len();
+        let x = &data[start * d..(start + rows) * d];
+        let mut x_norms = vec![0.0f32; rows];
+        let mut use_gemm = vec![false; rows];
+        let mut safe_rows = 0;
+        for i in 0..rows {
+            let x_i = &x[i * d..(i + 1) * d];
+            x_norms[i] = fvec_norm_l2sqr(x_i);
+            let e_gemm = gemm_error(x_norms[i], c_max, d);
+            let to_mean = fvec_l2sqr(x_i, &mean) as f64;
+            // `!(a < b)` also catches NaN on either side.
+            use_gemm[i] = 2.0 * e_gemm < to_mean;
+            safe_rows += usize::from(use_gemm[i]);
+        }
+        let mut dists: Vec<(f32, usize)> = Vec::new();
+        if safe_rows == rows {
+            let mut ip = vec![0.0f32; rows * k];
+            #[cfg(test)]
+            record_certified_sgemm_rows(rows);
+            sgemm_a_bt(rows, k, d, 1.0, x, centroids, 0.0, &mut ip);
+            for (i, slot) in chunk.iter_mut().enumerate() {
+                let x_i = &x[i * d..(i + 1) * d];
+                let top = certified_topk_row(
+                    x_i,
+                    x_norms[i],
+                    &ip[i * k..(i + 1) * k],
+                    centroids,
+                    c_norms,
+                    c_max,
+                    d,
+                    nprobe,
+                    &mut dists,
+                );
+                emit(slot, top);
+            }
+            return;
+        }
+
+        for (i, slot) in chunk.iter_mut().enumerate() {
+            if !use_gemm[i] {
+                let x_i = &x[i * d..(i + 1) * d];
+                let (ids, distances) = find_topk(x_i, centroids, k, d, nprobe);
+                dists.clear();
+                dists.extend(distances.into_iter().zip(ids));
+                emit(slot, &dists);
+            }
+        }
+        if safe_rows == 0 {
+            return;
+        }
+
+        let packed_rows = assignment_block_plan(
+            safe_rows,
+            d,
+            k,
+            if parallel {
+                rayon::current_num_threads()
+            } else {
+                1
+            },
+            0,
+            d.saturating_add(2),
+        )
+        .0;
+        let mut indices = Vec::with_capacity(packed_rows);
+        let mut packed = Vec::with_capacity(packed_rows * d);
+        let mut ip = Vec::with_capacity(packed_rows * k);
+        let mut process_safe = |indices: &[usize], packed: &[f32]| {
+            let batch_rows = indices.len();
+            ip.resize(batch_rows * k, 0.0);
+            #[cfg(test)]
+            record_certified_sgemm_rows(batch_rows);
+            sgemm_a_bt(batch_rows, k, d, 1.0, packed, centroids, 0.0, &mut ip);
+            for (packed_row, &row) in indices.iter().enumerate() {
+                let x_i = &x[row * d..(row + 1) * d];
+                let top = certified_topk_row(
+                    x_i,
+                    x_norms[row],
+                    &ip[packed_row * k..(packed_row + 1) * k],
+                    centroids,
+                    c_norms,
+                    c_max,
+                    d,
+                    nprobe,
+                    &mut dists,
+                );
+                emit(&mut chunk[row], top);
+            }
+        };
+        for (row, &safe) in use_gemm.iter().enumerate() {
+            if !safe {
+                continue;
+            }
+            indices.push(row);
+            packed.extend_from_slice(&x[row * d..(row + 1) * d]);
+            if indices.len() == packed_rows {
+                process_safe(&indices, &packed);
+                indices.clear();
+                packed.clear();
+            }
+        }
+        if !indices.is_empty() {
+            process_safe(&indices, &packed);
+        }
+    };
+    if parallel {
+        out.par_chunks_mut(block_rows).enumerate().for_each(block);
+    } else {
+        out.chunks_mut(block_rows).enumerate().for_each(block);
+    }
 }
 
 pub fn find_topk(
@@ -786,10 +967,10 @@ pub fn find_topk_batch(
     d: usize,
     nprobe: usize,
 ) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
-    (0..nq)
-        .into_par_iter()
-        .map(|qi| find_topk(&queries[qi * d..(qi + 1) * d], centroids, k, d, nprobe))
-        .unzip()
+    let centroid_norms = (0..k)
+        .map(|c| fvec_norm_l2sqr(&centroids[c * d..(c + 1) * d]))
+        .collect::<Vec<_>>();
+    find_topk_batch_with_centroid_norms(queries, nq, centroids, &centroid_norms, k, d, nprobe)
 }
 
 pub(crate) fn find_topk_batch_with_centroid_norms(
@@ -802,7 +983,199 @@ pub(crate) fn find_topk_batch_with_centroid_norms(
     nprobe: usize,
 ) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
     debug_assert_eq!(centroid_norms.len(), k);
-    find_topk_batch(queries, nq, centroids, k, d, nprobe)
+    let nprobe = nprobe.min(k);
+    if nprobe == 0 {
+        return (vec![Vec::new(); nq], vec![Vec::new(); nq]);
+    }
+    if nq == 1 || d == 0 {
+        return (0..nq)
+            .map(|qi| find_topk(&queries[qi * d..(qi + 1) * d], centroids, k, d, nprobe))
+            .unzip();
+    }
+    let mut out: Vec<(Vec<usize>, Vec<f32>)> = vec![(Vec::new(), Vec::new()); nq];
+    certified_topk_blocks(
+        queries,
+        nq,
+        centroids,
+        centroid_norms,
+        k,
+        d,
+        nprobe,
+        &mut out,
+        |slot, top| {
+            slot.0.extend(top.iter().map(|&(_, i)| i));
+            slot.1.extend(top.iter().map(|&(dist, _)| dist));
+        },
+    );
+    out.into_iter().unzip()
+}
+
+/// Upper bound on the largest centroid norm from the f32 squared norms.
+fn centroid_norm_upper(c_norms: &[f32], d: usize) -> f64 {
+    let max = c_norms.iter().copied().fold(0.0f32, f32::max) as f64;
+    (max / (1.0 - gamma_f32(d))).sqrt()
+}
+
+/// Bound on `|fl(|x|² + |c|² - 2 x·c) - |x - c|²|` for a row of f32 squared
+/// norm `x_norm` and centroids of norm at most `c_max`: the two norms and the
+/// inner product each carry the standard `γ_d` dot-product rounding, the two
+/// combining operations one rounding each.
+fn gemm_error(x_norm: f32, c_max: f64, d: usize) -> f64 {
+    let x_up = (x_norm as f64 / (1.0 - gamma_f32(d))).sqrt();
+    let sum = x_up + c_max;
+    gamma_f32(d + 2) * sum * sum
+}
+
+fn gamma_f32(operations: usize) -> f64 {
+    let error = (f32::EPSILON as f64 / 2.0) * operations as f64;
+    if error < 1.0 {
+        error / (1.0 - error)
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Direct distances of four centroids at a time (same accumulation order as
+/// `fvec_l2sqr`, so the result equals `find_topk`'s bit for bit).
+fn direct_distances(x: &[f32], centroids: &[f32], d: usize, slots: &mut [(f32, usize)]) {
+    let mut chunks = slots.chunks_exact_mut(4);
+    for group in &mut chunks {
+        let dists = fvec_l2sqr_four(
+            x,
+            &centroids[group[0].1 * d..(group[0].1 + 1) * d],
+            &centroids[group[1].1 * d..(group[1].1 + 1) * d],
+            &centroids[group[2].1 * d..(group[2].1 + 1) * d],
+            &centroids[group[3].1 * d..(group[3].1 + 1) * d],
+        );
+        for (slot, dist) in group.iter_mut().zip(dists) {
+            slot.0 = dist;
+        }
+    }
+    for slot in chunks.into_remainder() {
+        slot.0 = fvec_l2sqr(x, &centroids[slot.1 * d..(slot.1 + 1) * d]);
+    }
+}
+
+/// Top-`nprobe` centroids of one row from its SGEMM inner products, with the
+/// contract of `find_topk` (direct `fvec_l2sqr` distances, ties by index).
+///
+/// With `E = gemm_error + γ(d+3)·D` (the direct kernel's own rounding added)
+/// and `D` the `nprobe`-th SGEMM distance, the direct kernel's `nprobe`-th
+/// distance lies in `[D - E, D + E]`: a centroid whose SGEMM distance is
+/// below `D - 2E` is in the direct top-`nprobe` set and one above `D + 2E`
+/// is not. When nothing outside the SGEMM top-`nprobe` lies within `D + 2E`
+/// the set is certified as is (the common case); otherwise the direct kernel
+/// decides the centroids inside `[D - 2E, D + 2E]`, typically one or two.
+/// The selected centroids are then re-measured with the direct kernel and
+/// ordered by (distance, index), so the returned values equal `find_topk`.
+#[allow(clippy::too_many_arguments)]
+fn certified_topk_row<'a>(
+    x: &[f32],
+    x_norm: f32,
+    ip: &[f32],
+    centroids: &[f32],
+    c_norms: &[f32],
+    c_max: f64,
+    d: usize,
+    nprobe: usize,
+    dists: &'a mut Vec<(f32, usize)>,
+) -> &'a [(f32, usize)] {
+    let k = c_norms.len();
+    let e_gemm = gemm_error(x_norm, c_max, d);
+    let error = |kth: f64| e_gemm + gamma_f32(d + 3) * (kth + 2.0 * e_gemm);
+    dists.clear();
+    if nprobe == 1 && k > 1 {
+        // Argmin pass tracking the runner-up value (no scratch, no select).
+        let mut best = f32::INFINITY;
+        let mut best_idx = 0;
+        let mut second = f32::INFINITY;
+        for c in 0..k {
+            let approximate = x_norm + c_norms[c] - 2.0 * ip[c];
+            if !approximate.is_finite() {
+                let (ids, distances) = find_topk(x, centroids, k, d, nprobe);
+                dists.extend(distances.into_iter().zip(ids));
+                return dists;
+            }
+            let dist = approximate.max(0.0);
+            if dist < best {
+                second = best;
+                best = dist;
+                best_idx = c;
+            } else if dist < second {
+                second = dist;
+            }
+        }
+        let upper = best as f64 + 2.0 * error(best as f64);
+        let mut top = (f32::INFINITY, best_idx);
+        if second as f64 > upper {
+            top.0 = fvec_l2sqr(x, &centroids[best_idx * d..(best_idx + 1) * d]);
+        } else {
+            top.1 = usize::MAX;
+            for c in 0..k {
+                let dist = (x_norm + c_norms[c] - 2.0 * ip[c]).max(0.0);
+                if dist as f64 <= upper {
+                    let direct = fvec_l2sqr(x, &centroids[c * d..(c + 1) * d]);
+                    if direct < top.0 || (direct == top.0 && c < top.1) {
+                        top = (direct, c);
+                    }
+                }
+            }
+        }
+        dists.push(top);
+        return &dists[..];
+    }
+    for c in 0..k {
+        let approximate = x_norm + c_norms[c] - 2.0 * ip[c];
+        if !approximate.is_finite() {
+            let (ids, distances) = find_topk(x, centroids, k, d, nprobe);
+            dists.clear();
+            dists.extend(distances.into_iter().zip(ids));
+            return dists;
+        }
+        dists.push((approximate.max(0.0), c));
+    }
+    if nprobe >= k {
+        direct_distances(x, centroids, d, dists);
+        dists.sort_by(compare_distance_then_index);
+        return &dists[..];
+    }
+    // Partition so [..nprobe] holds the nprobe smallest and [nprobe] the next.
+    dists.select_nth_unstable_by(nprobe, compare_distance_then_index);
+    let kth = dists[..nprobe]
+        .iter()
+        .map(|&(dist, _)| dist)
+        .fold(0.0f32, f32::max) as f64;
+    let next = dists[nprobe].0 as f64;
+    let e = error(kth);
+    let upper = kth + 2.0 * e;
+    if next > upper {
+        direct_distances(x, centroids, d, &mut dists[..nprobe]);
+        dists[..nprobe].sort_by(compare_distance_then_index);
+        return &dists[..nprobe];
+    }
+    let lower = kth - 2.0 * e;
+    // Members below `lower` are certainly in; move them to the front.
+    let mut certain = 0;
+    for i in 0..nprobe {
+        if (dists[i].0 as f64) < lower {
+            dists.swap(certain, i);
+            certain += 1;
+        }
+    }
+    // Everything in [lower, upper] is decided by the direct kernel.
+    let mut band: Vec<(f32, usize)> = dists[certain..]
+        .iter()
+        .filter(|&&(dist, _)| (dist as f64) <= upper)
+        .copied()
+        .collect();
+    direct_distances(x, centroids, d, &mut band);
+    let slots = nprobe - certain;
+    debug_assert!(band.len() >= slots);
+    select_topk_prefix(&mut band, slots);
+    dists[certain..nprobe].copy_from_slice(&band[..slots]);
+    direct_distances(x, centroids, d, &mut dists[..certain]);
+    dists[..nprobe].sort_by(compare_distance_then_index);
+    &dists[..nprobe]
 }
 
 fn select_topk_prefix(dists: &mut [(f32, usize)], nprobe: usize) {
@@ -1646,5 +2019,107 @@ mod tests {
             }
         }
         assert!(!all_same, "All centroids are identical");
+    }
+
+    #[test]
+    fn test_batch_falls_back_when_approximate_distance_overflows() {
+        let scale = f32::MAX.sqrt();
+        let query = scale * 0.80f32.sqrt();
+        let centroids = [scale * 0.19f32.sqrt(), scale * 0.30f32.sqrt()];
+        let queries = [query, query];
+
+        assert_eq!(find_nearest_batch(&queries, 2, &centroids, 2, 1), [1, 1]);
+    }
+
+    #[test]
+    fn test_mixed_block_sgemm_only_processes_safe_rows() {
+        let centroids = [-1.0, 1.0];
+        let queries: Vec<f32> = (0..32)
+            .map(|row| if row % 2 == 0 { 10.0 } else { f32::NAN })
+            .collect();
+
+        let (nearest, gemm_rows) = pool(1).install(|| {
+            CERTIFIED_SGEMM_ROWS.with(|count| count.set(Some(0)));
+            let nearest = find_nearest_batch(&queries, 32, &centroids, 2, 1);
+            let rows = CERTIFIED_SGEMM_ROWS.with(|count| count.replace(None).unwrap());
+            (nearest, rows)
+        });
+
+        assert_eq!(
+            nearest,
+            (0..32)
+                .map(|row| usize::from(row % 2 == 0))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(gemm_rows, 16);
+    }
+
+    /// Hybrid contract: batch results must equal the direct `find_topk` set
+    /// (ties by index) on benign, offset, and tied data.
+    #[test]
+    fn test_batch_topk_matches_direct_contract() {
+        let d = 96;
+        let k = 300;
+        let nq = 1200;
+        let mut rng = StdRng::seed_from_u64(9);
+        let base: Vec<f32> = (0..k * d).map(|_| rng.gen::<f32>() - 0.5).collect();
+        let mut centroids = base.clone();
+        // exact duplicates (ties) and near-duplicates (1 ulp apart)
+        for c in 0..20 {
+            let (src, dst) = (c * 7 % k, k - 1 - c);
+            let row: Vec<f32> = centroids[src * d..(src + 1) * d].to_vec();
+            centroids[dst * d..(dst + 1) * d].copy_from_slice(&row);
+            if c % 2 == 0 {
+                centroids[dst * d] = f32::from_bits(centroids[dst * d].to_bits() + 1);
+            }
+        }
+        let mut queries: Vec<f32> = (0..nq * d).map(|_| rng.gen::<f32>() - 0.5).collect();
+        // rows sitting exactly on a centroid, and rows in the middle of two
+        for q in 0..200 {
+            let c = q % k;
+            queries[q * d..(q + 1) * d].copy_from_slice(&centroids[c * d..(c + 1) * d]);
+        }
+        for q in 200..400 {
+            let (a, b) = ((q * 3) % k, (q * 5 + 1) % k);
+            for j in 0..d {
+                queries[q * d + j] = 0.5 * (centroids[a * d + j] + centroids[b * d + j]);
+            }
+        }
+        // non-finite and overflowing rows must behave like `find_topk`
+        queries[400 * d] = f32::NAN;
+        queries[401 * d + 3] = f32::INFINITY;
+        queries[402 * d + 5] = -f32::INFINITY;
+        for v in queries[403 * d..404 * d].iter_mut() {
+            *v = 1.0e30;
+        }
+        for (label, offset, scale) in [
+            ("benign", 0.0f32, 1.0f32),
+            ("offset1e8", 1.0e8, 4.0),
+            ("offset1e4", 1.0e4, 1.0),
+        ] {
+            let c2: Vec<f32> = centroids.iter().map(|v| v * scale + offset).collect();
+            let q2: Vec<f32> = queries.iter().map(|v| v * scale + offset).collect();
+            for nprobe in [1usize, 2, 8, 64, k] {
+                let (batch, bdist) = find_topk_batch(&q2, nq, &c2, k, d, nprobe);
+                for qi in 0..nq {
+                    let (direct, ddist) = find_topk(&q2[qi * d..(qi + 1) * d], &c2, k, d, nprobe);
+                    assert_eq!(
+                        batch[qi], direct,
+                        "{label} nprobe={nprobe} row {qi} ids differ"
+                    );
+                    let bb: Vec<u32> = bdist[qi].iter().map(|v| v.to_bits()).collect();
+                    let db: Vec<u32> = ddist.iter().map(|v| v.to_bits()).collect();
+                    assert_eq!(bb, db, "{label} nprobe={nprobe} row {qi} distances differ");
+                }
+                let nearest = find_nearest_batch(&q2, nq, &c2, k, d);
+                for qi in 0..nq {
+                    assert_eq!(
+                        nearest[qi],
+                        find_nearest(&q2[qi * d..(qi + 1) * d], &c2, k, d),
+                        "{label} nearest row {qi}"
+                    );
+                }
+            }
+        }
     }
 }

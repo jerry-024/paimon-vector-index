@@ -5583,4 +5583,75 @@ mod tests {
     fn ivfpq_rejects_odd_4bit_subquantizer_count_at_construction() {
         let _ = IVFPQIndex::with_nbits(12, 4, 3, 4, MetricType::L2, false);
     }
+
+    /// Regression for review r3869883629: build (both modes) and query must
+    /// agree on the nearest list even when the data is translated to 1e8.
+    #[test]
+    fn test_translated_vectors_share_one_coarse_contract() {
+        let d = 64;
+        let nlist = 64;
+        let n = 4000;
+        let mut data = generate_low_rank_data(n, d, 8, 0.2, 77);
+        for v in data.iter_mut() {
+            *v = *v * 4.0 + 1.0e8;
+        }
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let mut disabled = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false)
+            .with_projected_assignment(ProjectedAssignment::Disabled);
+        disabled.train(&data, n);
+        let mut enabled = IVFPQIndex::from_trained(&disabled);
+        enabled.set_projected_assignment(ProjectedAssignment::Enabled);
+        assert!(enabled.coarse_projection().is_some(), "projection declined");
+        disabled.add(&data, &ids, n);
+        enabled.add(&data, &ids, n);
+        let bd = bucket_of(&disabled, n);
+        let be = bucket_of(&enabled, n);
+        let mismatch = (0..n).filter(|&i| bd[i] != be[i]).count();
+        // true nearest by f64
+        let mut true_best = vec![0usize; n];
+        for i in 0..n {
+            let mut best = f64::INFINITY;
+            for c in 0..nlist {
+                let dist: f64 = (0..d)
+                    .map(|j| {
+                        let t =
+                            data[i * d + j] as f64 - disabled.quantizer_centroids[c * d + j] as f64;
+                        t * t
+                    })
+                    .sum();
+                if dist < best {
+                    best = dist;
+                    true_best[i] = c;
+                }
+            }
+        }
+        let wrong_d = (0..n).filter(|&i| bd[i] != true_best[i]).count();
+        let wrong_e = (0..n).filter(|&i| be[i] != true_best[i]).count();
+        // self-query, nprobe=1, single and batch
+        let mut miss = [0usize; 4];
+        for (ix, index) in [&disabled, &enabled].iter().enumerate() {
+            for i in 0..n {
+                let mut dists = vec![0.0f32; 1];
+                let mut labels = vec![-1i64; 1];
+                index.search(&data[i * d..(i + 1) * d], 1, 1, 1, &mut dists, &mut labels);
+                if labels[0] == -1 {
+                    miss[ix * 2] += 1;
+                }
+            }
+            let mut dists = vec![0.0f32; n];
+            let mut labels = vec![-1i64; n];
+            index.search(&data, n, 1, 1, &mut dists, &mut labels);
+            miss[ix * 2 + 1] = (0..n).filter(|&i| labels[i] == -1).count();
+        }
+        assert_eq!(mismatch, 0, "Enabled and Disabled assign different lists");
+        assert_eq!(
+            (wrong_d, wrong_e),
+            (0, 0),
+            "assignment differs from the f64 nearest centroid"
+        );
+        assert_eq!(
+            miss, [0; 4],
+            "self queries with nprobe=1 returned empty results"
+        );
+    }
 }
