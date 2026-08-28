@@ -1067,6 +1067,16 @@ fn gamma_f32(operations: usize) -> f64 {
     }
 }
 
+fn certified_error(e_gemm: f64, kth: f64, d: usize) -> f64 {
+    let gamma = gamma_f32(d + 3);
+    let denominator = 1.0 - 2.0 * gamma;
+    if denominator > 0.0 {
+        (e_gemm * (1.0 + gamma) + gamma * kth) / denominator
+    } else {
+        f64::INFINITY
+    }
+}
+
 /// Direct distances of four centroids at a time (same accumulation order as
 /// `fvec_l2sqr`, so the result equals `find_topk`'s bit for bit).
 fn direct_distances(x: &[f32], centroids: &[f32], d: usize, slots: &mut [(f32, usize)]) {
@@ -1091,9 +1101,9 @@ fn direct_distances(x: &[f32], centroids: &[f32], d: usize, slots: &mut [(f32, u
 /// Top-`nprobe` centroids of one row from its SGEMM inner products, with the
 /// contract of `find_topk` (direct `fvec_l2sqr` distances, ties by index).
 ///
-/// With `E = gemm_error + γ(d+3)·D` (the direct kernel's own rounding added)
-/// and `D` the `nprobe`-th SGEMM distance, the direct kernel's `nprobe`-th
-/// distance lies in `[D - E, D + E]`: a centroid whose SGEMM distance is
+/// With `E` chosen so `E = gemm_error + γ(d+3)·(D + 2E + gemm_error)`
+/// and `D` the `nprobe`-th SGEMM distance, every candidate through `D + 2E`
+/// is within `E` of its direct distance: a centroid whose SGEMM distance is
 /// below `D - 2E` is in the direct top-`nprobe` set and one above `D + 2E`
 /// is not. When nothing outside the SGEMM top-`nprobe` lies within `D + 2E`
 /// the set is certified as is (the common case); otherwise the direct kernel
@@ -1114,7 +1124,6 @@ fn certified_topk_row<'a>(
 ) -> &'a [(f32, usize)] {
     let k = c_norms.len();
     let e_gemm = gemm_error(x_norm, c_max, d);
-    let error = |kth: f64| e_gemm + gamma_f32(d + 3) * (kth + 2.0 * e_gemm);
     dists.clear();
     if nprobe == 1 && k > 1 {
         // Argmin pass tracking the runner-up value (no scratch, no select).
@@ -1137,7 +1146,7 @@ fn certified_topk_row<'a>(
                 second = dist;
             }
         }
-        let upper = best as f64 + 2.0 * error(best as f64);
+        let upper = best as f64 + 2.0 * certified_error(e_gemm, best as f64, d);
         let mut top = (f32::INFINITY, best_idx);
         if second as f64 > upper {
             top.0 = fvec_l2sqr(x, &centroids[best_idx * d..(best_idx + 1) * d]);
@@ -1178,7 +1187,7 @@ fn certified_topk_row<'a>(
         .map(|&(dist, _)| dist)
         .fold(0.0f32, f32::max) as f64;
     let next = dists[nprobe].0 as f64;
-    let e = error(kth);
+    let e = certified_error(e_gemm, kth, d);
     let upper = kth + 2.0 * e;
     if next > upper {
         direct_distances(x, centroids, d, &mut dists[..nprobe]);
@@ -1392,6 +1401,23 @@ fn subsample(data: &[f32], n: usize, d: usize, target_n: usize, rng: &mut StdRng
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_certified_error_covers_band_upper_bound() {
+        let d = 768;
+        let e_gemm = gamma_f32(d + 2) * 4.0;
+        let kth = 0.1;
+        let gamma = gamma_f32(d + 3);
+        let error = certified_error(e_gemm, kth, d);
+        let upper = kth + 2.0 * error;
+
+        assert!(error >= e_gemm + gamma * (upper + e_gemm));
+    }
+
+    #[test]
+    fn test_certified_error_falls_back_when_fixed_point_diverges() {
+        assert!(certified_error(1.0, 1.0, 6_000_000).is_infinite());
+    }
 
     /// Sequential scalar reference for cluster assignment. Mirrors the
     /// balance-penalty semantics of a single (unchunked) call.
