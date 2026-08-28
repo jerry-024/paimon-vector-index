@@ -26,6 +26,7 @@ const MAX_MATRIX_ELEMS: usize = 4 * 1024 * 1024;
 const MIN_BLOCK_ROWS: usize = 32;
 const MIN_BLOCK_FLOPS: usize = 4_000_000;
 const TARGET_BLOCKS: usize = 64;
+const DIRECT_ROWS_PER_THREAD: usize = 8;
 
 #[cfg(test)]
 std::thread_local! {
@@ -50,6 +51,18 @@ fn checked_matrix_len(name: &str, rows: usize, cols: usize) -> usize {
 fn assert_data_shape(data: &[f32], n: usize, d: usize) {
     let expected = checked_matrix_len("data", n, d);
     assert_eq!(data.len(), expected, "data length does not match n * d");
+}
+
+fn use_direct_batch(rows: usize, threads: usize) -> bool {
+    rows < DIRECT_ROWS_PER_THREAD.saturating_mul(threads.max(1))
+}
+
+fn topk_worker_scratch(k: usize, nprobe: usize) -> usize {
+    let tuple_elems = std::mem::size_of::<(f32, usize)>().div_ceil(std::mem::size_of::<f32>());
+    let tuple_buffers = 1 + usize::from(nprobe > 1 && nprobe < k);
+    (if nprobe == 1 { 1 } else { k })
+        .saturating_mul(tuple_elems)
+        .saturating_mul(tuple_buffers)
 }
 
 pub(crate) fn assignment_block_plan(
@@ -77,7 +90,7 @@ pub(crate) fn assignment_block_plan(
     let budget_rows = ((worker_budget - fixed_scratch) / row_elems)
         .max(1)
         .min(max_rows);
-    if budget_rows < min_rows {
+    if budget_rows < min_rows && budget_rows.saturating_mul(row_flops) < MIN_BLOCK_FLOPS {
         return (budget_rows, false);
     }
 
@@ -753,8 +766,9 @@ pub(crate) fn find_nearest_batch(
     if n == 0 || k == 0 {
         return Vec::new();
     }
-    if n == 1 || d == 0 {
+    if use_direct_batch(n, rayon::current_num_threads()) || d == 0 {
         return (0..n)
+            .into_par_iter()
             .map(|i| find_nearest(&data[i * d..(i + 1) * d], centroids, k, d))
             .collect();
     }
@@ -807,7 +821,9 @@ fn certified_topk_blocks<T: Send>(
         }
     }
     let mean: Vec<f32> = mean.iter().map(|m| (m / k as f64) as f32).collect();
-    let (block_rows, parallel) = assignment_block_plan(n, d, k, rayon::current_num_threads(), 0, 0);
+    let topk_scratch = topk_worker_scratch(k, nprobe);
+    let (block_rows, parallel) =
+        assignment_block_plan(n, d, k, rayon::current_num_threads(), topk_scratch, 2);
     let block = |(b, chunk): (usize, &mut [T])| {
         let start = b * block_rows;
         let rows = chunk.len();
@@ -824,7 +840,7 @@ fn certified_topk_blocks<T: Send>(
             use_gemm[i] = 2.0 * e_gemm < to_mean;
             safe_rows += usize::from(use_gemm[i]);
         }
-        let mut dists: Vec<(f32, usize)> = Vec::new();
+        let mut dists: Vec<(f32, usize)> = Vec::with_capacity(if nprobe == 1 { 1 } else { k });
         if safe_rows == rows {
             let mut ip = vec![0.0f32; rows * k];
             #[cfg(test)]
@@ -861,6 +877,7 @@ fn certified_topk_blocks<T: Send>(
             return;
         }
 
+        let live_scratch = topk_scratch.saturating_add(rows.saturating_mul(2));
         let packed_rows = assignment_block_plan(
             safe_rows,
             d,
@@ -870,7 +887,7 @@ fn certified_topk_blocks<T: Send>(
             } else {
                 1
             },
-            0,
+            live_scratch,
             d.saturating_add(2),
         )
         .0;
@@ -957,6 +974,20 @@ pub fn find_topk(
     (indices, distances)
 }
 
+fn find_topk_batch_direct(
+    queries: &[f32],
+    nq: usize,
+    centroids: &[f32],
+    k: usize,
+    d: usize,
+    nprobe: usize,
+) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
+    (0..nq)
+        .into_par_iter()
+        .map(|qi| find_topk(&queries[qi * d..(qi + 1) * d], centroids, k, d, nprobe))
+        .unzip()
+}
+
 /// Batch find top-nprobe nearest centroids for multiple queries.
 /// Returns (all_indices, all_distances) each of length nq * nprobe.
 pub fn find_topk_batch(
@@ -967,6 +998,9 @@ pub fn find_topk_batch(
     d: usize,
     nprobe: usize,
 ) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
+    if use_direct_batch(nq, rayon::current_num_threads()) || d == 0 {
+        return find_topk_batch_direct(queries, nq, centroids, k, d, nprobe);
+    }
     let centroid_norms = (0..k)
         .map(|c| fvec_norm_l2sqr(&centroids[c * d..(c + 1) * d]))
         .collect::<Vec<_>>();
@@ -987,10 +1021,8 @@ pub(crate) fn find_topk_batch_with_centroid_norms(
     if nprobe == 0 {
         return (vec![Vec::new(); nq], vec![Vec::new(); nq]);
     }
-    if nq == 1 || d == 0 {
-        return (0..nq)
-            .map(|qi| find_topk(&queries[qi * d..(qi + 1) * d], centroids, k, d, nprobe))
-            .unzip();
+    if use_direct_batch(nq, rayon::current_num_threads()) || d == 0 {
+        return find_topk_batch_direct(queries, nq, centroids, k, d, nprobe);
     }
     let mut out: Vec<(Vec<usize>, Vec<f32>)> = vec![(Vec::new(), Vec::new()); nq];
     certified_topk_blocks(
@@ -1163,11 +1195,13 @@ fn certified_topk_row<'a>(
         }
     }
     // Everything in [lower, upper] is decided by the direct kernel.
-    let mut band: Vec<(f32, usize)> = dists[certain..]
-        .iter()
-        .filter(|&&(dist, _)| (dist as f64) <= upper)
-        .copied()
-        .collect();
+    let mut band = Vec::with_capacity(dists.len() - certain);
+    band.extend(
+        dists[certain..]
+            .iter()
+            .filter(|&&(dist, _)| (dist as f64) <= upper)
+            .copied(),
+    );
     direct_distances(x, centroids, d, &mut band);
     let slots = nprobe - certain;
     debug_assert!(band.len() >= slots);
@@ -1506,9 +1540,49 @@ mod tests {
         assert!(rows * 4096 * 32 <= MAX_MATRIX_ELEMS);
 
         let (rows, parallel) = assignment_block_plan(100_000, 32, 4096, 32, 4096 * 6, 0);
-        assert!(!parallel);
+        assert!(parallel);
         assert_eq!(rows, 26);
         assert!(rows * 4096 + 4096 * 6 <= MAX_MATRIX_ELEMS / 32);
+
+        let fixed = topk_worker_scratch(4096, 8);
+        let (rows, parallel) = assignment_block_plan(100_000, 32, 4096, 32, fixed, 2);
+        assert!(parallel);
+        assert_eq!(rows, 23);
+        assert!(rows * (4096 + 2) + fixed <= MAX_MATRIX_ELEMS / 32);
+
+        let live_scratch = fixed + rows * 2;
+        let (packed_rows, packed_parallel) =
+            assignment_block_plan(rows, 32, 4096, 32, live_scratch, 32 + 2);
+        assert!(packed_parallel);
+        assert!(packed_rows * (4096 + 32 + 2) + live_scratch <= MAX_MATRIX_ELEMS / 32);
+    }
+
+    #[test]
+    fn test_small_batch_direct_cutoff() {
+        assert!(use_direct_batch(31, 4));
+        assert!(!use_direct_batch(32, 4));
+
+        let centroids = [-1.0, 1.0];
+        let centroid_norms = [1.0, 1.0];
+        let queries = vec![10.0; 8];
+        let (direct_rows, blocked_rows) = pool(1).install(|| {
+            CERTIFIED_SGEMM_ROWS.with(|count| count.set(Some(0)));
+            find_topk_batch_with_centroid_norms(
+                &queries[..7],
+                7,
+                &centroids,
+                &centroid_norms,
+                2,
+                1,
+                1,
+            );
+            let direct_rows = CERTIFIED_SGEMM_ROWS.with(|count| count.get().unwrap());
+            find_topk_batch_with_centroid_norms(&queries, 8, &centroids, &centroid_norms, 2, 1, 1);
+            let blocked_rows = CERTIFIED_SGEMM_ROWS.with(|count| count.replace(None).unwrap());
+            (direct_rows, blocked_rows)
+        });
+        assert_eq!(direct_rows, 0);
+        assert_eq!(blocked_rows, 8);
     }
 
     #[test]
