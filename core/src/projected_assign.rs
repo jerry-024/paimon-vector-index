@@ -89,6 +89,34 @@ const SIGMA_MIN_SQ: f64 = (1.0 - ORTHO_MARGIN) * (1.0 - ORTHO_MARGIN) * (1.0 - G
 /// Candidates evaluated per branch-and-bound stage before re-pruning.
 const STAGE: usize = 32;
 
+fn projected_assignment_block_plan(
+    n: usize,
+    d: usize,
+    dp: usize,
+    nlist: usize,
+    threads: usize,
+) -> (usize, bool) {
+    // Score phase per worker: bounds (f64) and candidates (f64 + u32).
+    let fixed_scratch = nlist.saturating_mul(
+        (std::mem::size_of::<f64>() + std::mem::size_of::<(f64, u32)>())
+            .div_ceil(std::mem::size_of::<f32>()),
+    );
+    // Projection and score temporaries do not overlap. Count the larger
+    // per-row peak; the planner already includes one nlist-wide score row.
+    let projection_row_elems = d
+        .saturating_mul(2)
+        .saturating_add(dp.saturating_mul(3))
+        .saturating_add(2);
+    let score_matrix_row = nlist.max(1);
+    let score_row_elems = score_matrix_row.saturating_add(dp).saturating_add(2);
+    let row_scratch = projection_row_elems
+        .max(score_row_elems)
+        .saturating_sub(score_matrix_row);
+    let (block_rows, parallel) =
+        crate::kmeans::assignment_block_plan(n, dp, nlist, threads, fixed_scratch, row_scratch);
+    (block_rows.min(MAX_BLOCK_ROWS), parallel)
+}
+
 /// How `IVFPQIndex::add` chooses between the exact centroid scan and the
 /// projected branch-and-bound. Both produce the exact nearest centroid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -354,22 +382,8 @@ impl CoarseProjection {
         let dp = self.dp;
         debug_assert_eq!(self.cents_p.len(), nlist * dp);
         let mut out = vec![0usize; n];
-        // Per worker: bounds (f64) and candidates (f64 + u32), plus projected
-        // rows and their f64 norms. The planner already counts the score matrix.
-        let fixed_scratch = nlist.saturating_mul(
-            (std::mem::size_of::<f64>() + std::mem::size_of::<(f64, u32)>())
-                .div_ceil(std::mem::size_of::<f32>()),
-        );
-        let row_scratch = dp.saturating_add(2);
-        let (block_rows, parallel) = crate::kmeans::assignment_block_plan(
-            n,
-            dp,
-            nlist,
-            rayon::current_num_threads(),
-            fixed_scratch,
-            row_scratch,
-        );
-        let block_rows = block_rows.min(MAX_BLOCK_ROWS);
+        let (block_rows, parallel) =
+            projected_assignment_block_plan(n, d, dp, nlist, rayon::current_num_threads());
         let assign_block = |(bi, chunk): (usize, &mut [usize])| {
             let rows = chunk.len();
             let row0 = bi * block_rows;
@@ -964,6 +978,23 @@ fn orthonormalize_rows(m: &mut [f32], rows: usize, d: usize, rng: &mut StdRng) {
 mod tests {
     use super::*;
     use crate::kmeans;
+
+    #[test]
+    fn assignment_plan_counts_projection_scratch() {
+        let (n, d, dp, nlist, threads) = (100_000, 8192, 512, 512, 32);
+        let (block_rows, parallel) = projected_assignment_block_plan(n, d, dp, nlist, threads);
+        let workers = if parallel { threads } else { 1 };
+        let projection_row_elems = d
+            .saturating_mul(2)
+            .saturating_add(dp.saturating_mul(3))
+            .saturating_add(2);
+        let scratch_bytes = workers
+            .saturating_mul(block_rows)
+            .saturating_mul(projection_row_elems)
+            .saturating_mul(std::mem::size_of::<f32>());
+
+        assert!(scratch_bytes <= 16 * 1024 * 1024);
+    }
 
     fn low_rank_centroids(nlist: usize, d: usize, rank: usize, noise: f32, seed: u64) -> Vec<f32> {
         let mut rng = StdRng::seed_from_u64(seed);
