@@ -20,6 +20,7 @@ use crate::distance::{fvec_l2sqr, fvec_l2sqr_four, fvec_norm_l2sqr};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
+use std::collections::BinaryHeap;
 
 /// Cap aggregate concurrent assignment scratch to ~16MB (4M f32 elements).
 const MAX_MATRIX_ELEMS: usize = 4 * 1024 * 1024;
@@ -27,6 +28,40 @@ const MIN_BLOCK_ROWS: usize = 32;
 const MIN_BLOCK_FLOPS: usize = 4_000_000;
 const TARGET_BLOCKS: usize = 64;
 const DIRECT_ROWS_PER_THREAD: usize = 8;
+const CENTROID_TILE_COLS: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct DistanceIndex(f32, usize);
+
+impl PartialEq for DistanceIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for DistanceIndex {}
+
+impl PartialOrd for DistanceIndex {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DistanceIndex {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .total_cmp(&other.0)
+            .then_with(|| self.1.cmp(&other.1))
+    }
+}
+
+fn push_bounded_topk(heap: &mut BinaryHeap<DistanceIndex>, limit: usize, candidate: DistanceIndex) {
+    if heap.len() < limit {
+        heap.push(candidate);
+    } else if heap.peek().is_some_and(|worst| candidate < *worst) {
+        *heap.peek_mut().unwrap() = candidate;
+    }
+}
 
 #[cfg(test)]
 std::thread_local! {
@@ -58,21 +93,49 @@ fn use_direct_batch(rows: usize, threads: usize) -> bool {
 }
 
 fn use_parallel_direct_topk(nq: usize, k: usize, nprobe: usize, threads: usize) -> bool {
-    if nprobe.min(k) <= 1 {
-        return true;
-    }
-    let tuple_elems = std::mem::size_of::<(f32, usize)>().div_ceil(std::mem::size_of::<f32>());
-    k.saturating_mul(tuple_elems)
+    let nprobe = nprobe.min(k);
+    let tuples = if use_bounded_direct_topk(k, nprobe, threads) {
+        nprobe
+    } else if nprobe <= 1 {
+        1
+    } else {
+        k
+    };
+    tuples
+        .saturating_mul(topk_tuple_elems())
         .saturating_mul(nq.min(threads.max(1)))
         <= MAX_MATRIX_ELEMS
 }
 
+fn use_bounded_direct_topk(k: usize, nprobe: usize, threads: usize) -> bool {
+    nprobe > 1
+        && nprobe < k
+        && k.saturating_mul(topk_tuple_elems())
+            .saturating_mul(threads.max(1))
+            > MAX_MATRIX_ELEMS
+}
+
+fn topk_tuple_elems() -> usize {
+    std::mem::size_of::<(f32, usize)>().div_ceil(std::mem::size_of::<f32>())
+}
+
 fn topk_worker_scratch(k: usize, nprobe: usize) -> usize {
-    let tuple_elems = std::mem::size_of::<(f32, usize)>().div_ceil(std::mem::size_of::<f32>());
     let tuple_buffers = 1 + usize::from(nprobe > 1 && nprobe < k);
     (if nprobe == 1 { 1 } else { k })
-        .saturating_mul(tuple_elems)
+        .saturating_mul(topk_tuple_elems())
         .saturating_mul(tuple_buffers)
+}
+
+fn centroid_tile_size(k: usize, d: usize, nprobe: usize, threads: usize) -> Option<usize> {
+    let worker_budget = MAX_MATRIX_ELEMS / threads.max(1);
+    if nprobe <= 1 || nprobe >= k || topk_worker_scratch(k, nprobe) < worker_budget {
+        return None;
+    }
+    let heap_scratch = nprobe.saturating_mul(topk_tuple_elems()).saturating_mul(2);
+    let tile = CENTROID_TILE_COLS
+        .min(worker_budget.saturating_sub(d.saturating_add(heap_scratch).saturating_add(4)))
+        .min(k);
+    (tile > 0 && tile < k).then_some(tile)
 }
 
 pub(crate) fn assignment_block_plan(
@@ -161,7 +224,6 @@ fn kmeans_train_hierarchical(
     target_k: usize,
 ) -> Vec<f32> {
     use std::cmp::Ordering;
-    use std::collections::BinaryHeap;
 
     #[derive(Clone)]
     struct Cluster {
@@ -831,9 +893,14 @@ fn certified_topk_blocks<T: Send>(
         }
     }
     let mean: Vec<f32> = mean.iter().map(|m| (m / k as f64) as f32).collect();
+    let threads = rayon::current_num_threads();
+    if let Some(tile_cols) = centroid_tile_size(k, d, nprobe, threads) {
+        return certified_topk_blocks_tiled(
+            data, n, centroids, c_norms, c_max, &mean, k, d, nprobe, tile_cols, out, &emit,
+        );
+    }
     let topk_scratch = topk_worker_scratch(k, nprobe);
-    let (block_rows, parallel) =
-        assignment_block_plan(n, d, k, rayon::current_num_threads(), topk_scratch, 2);
+    let (block_rows, parallel) = assignment_block_plan(n, d, k, threads, topk_scratch, 2);
     let block = |(b, chunk): (usize, &mut [T])| {
         let start = b * block_rows;
         let rows = chunk.len();
@@ -949,9 +1016,164 @@ fn certified_topk_blocks<T: Send>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn certified_topk_blocks_tiled<T: Send>(
+    data: &[f32],
+    n: usize,
+    centroids: &[f32],
+    c_norms: &[f32],
+    c_max: f64,
+    mean: &[f32],
+    k: usize,
+    d: usize,
+    nprobe: usize,
+    tile_cols: usize,
+    out: &mut [T],
+    emit: &(impl Fn(&mut T, &[(f32, usize)]) + Sync),
+) {
+    let threads = rayon::current_num_threads();
+    let heap_scratch = nprobe.saturating_mul(topk_tuple_elems()).saturating_mul(2);
+    let (block_rows, planned_parallel) = assignment_block_plan(
+        n,
+        d,
+        tile_cols,
+        threads,
+        0,
+        d.saturating_add(heap_scratch).saturating_add(4),
+    );
+    let block_flops = block_rows
+        .saturating_mul(k)
+        .saturating_mul(d)
+        .saturating_mul(2);
+    let parallel = planned_parallel || (threads > 1 && block_flops >= MIN_BLOCK_FLOPS);
+    let block = |(b, chunk): (usize, &mut [T])| {
+        let start = b * block_rows;
+        let rows = chunk.len();
+        let x = &data[start * d..(start + rows) * d];
+        let mut x_norms = vec![0.0f32; rows];
+        let mut gemm_errors = vec![0.0f64; rows];
+        let mut safe_indices = Vec::with_capacity(rows);
+        let mut direct = Vec::new();
+        for (row, slot) in chunk.iter_mut().enumerate() {
+            let x_i = &x[row * d..(row + 1) * d];
+            x_norms[row] = fvec_norm_l2sqr(x_i);
+            let e_gemm = gemm_error(x_norms[row], c_max, d);
+            gemm_errors[row] = e_gemm;
+            let to_mean = fvec_l2sqr(x_i, mean) as f64;
+            if 2.0 * e_gemm < to_mean {
+                safe_indices.push(row);
+            } else {
+                let (ids, distances) = find_topk(x_i, centroids, k, d, nprobe);
+                direct.clear();
+                direct.extend(distances.into_iter().zip(ids));
+                emit(slot, &direct);
+            }
+        }
+        if safe_indices.is_empty() {
+            return;
+        }
+
+        let mut packed = Vec::with_capacity(safe_indices.len() * d);
+        for &row in &safe_indices {
+            packed.extend_from_slice(&x[row * d..(row + 1) * d]);
+        }
+        let mut states: Vec<_> = (0..safe_indices.len())
+            .map(|_| {
+                (
+                    BinaryHeap::with_capacity(nprobe),
+                    BinaryHeap::with_capacity(nprobe),
+                    true,
+                )
+            })
+            .collect();
+        let mut ip = Vec::with_capacity(safe_indices.len() * tile_cols);
+        for tile_start in (0..k).step_by(tile_cols) {
+            let tile_len = tile_cols.min(k - tile_start);
+            ip.resize(safe_indices.len() * tile_len, 0.0);
+            #[cfg(test)]
+            record_certified_sgemm_rows(safe_indices.len());
+            sgemm_a_bt(
+                safe_indices.len(),
+                tile_len,
+                d,
+                1.0,
+                &packed,
+                &centroids[tile_start * d..(tile_start + tile_len) * d],
+                0.0,
+                &mut ip,
+            );
+            for (packed_row, &row) in safe_indices.iter().enumerate() {
+                let (approximate_top, exact_top, valid) = &mut states[packed_row];
+                if !*valid {
+                    continue;
+                }
+                let inner_products = &ip[packed_row * tile_len..(packed_row + 1) * tile_len];
+                for (offset, &inner_product) in inner_products.iter().enumerate() {
+                    let c = tile_start + offset;
+                    let approximate = x_norms[row] + c_norms[c] - 2.0 * inner_product;
+                    if !approximate.is_finite() {
+                        *valid = false;
+                        break;
+                    }
+                    push_bounded_topk(
+                        approximate_top,
+                        nprobe,
+                        DistanceIndex(approximate.max(0.0), c),
+                    );
+                }
+                if !*valid {
+                    continue;
+                }
+                let upper = if approximate_top.len() < nprobe {
+                    f64::INFINITY
+                } else {
+                    let kth = approximate_top.peek().unwrap().0 as f64;
+                    kth + 2.0 * certified_error(gemm_errors[row], kth, d)
+                };
+                let x_i = &x[row * d..(row + 1) * d];
+                // The upper bound only shrinks, so discarded candidates cannot re-enter later.
+                for (offset, &inner_product) in inner_products.iter().enumerate() {
+                    let c = tile_start + offset;
+                    let approximate = (x_norms[row] + c_norms[c] - 2.0 * inner_product).max(0.0);
+                    if approximate as f64 <= upper {
+                        push_bounded_topk(
+                            exact_top,
+                            nprobe,
+                            DistanceIndex(fvec_l2sqr(x_i, &centroids[c * d..(c + 1) * d]), c),
+                        );
+                    }
+                }
+            }
+        }
+
+        for ((approximate_top, exact_top, valid), row) in states.into_iter().zip(safe_indices) {
+            let slot = &mut chunk[row];
+            if !valid || approximate_top.len() < nprobe || exact_top.len() < nprobe {
+                let x_i = &x[row * d..(row + 1) * d];
+                let (ids, distances) = find_topk(x_i, centroids, k, d, nprobe);
+                direct.clear();
+                direct.extend(distances.into_iter().zip(ids));
+                emit(slot, &direct);
+                continue;
+            }
+            let top: Vec<_> = exact_top
+                .into_sorted_vec()
+                .into_iter()
+                .map(|candidate| (candidate.0, candidate.1))
+                .collect();
+            emit(slot, &top);
+        }
+    };
+    if parallel {
+        out.par_chunks_mut(block_rows).enumerate().for_each(block);
+    } else {
+        out.chunks_mut(block_rows).enumerate().for_each(block);
+    }
+}
+
 fn find_top1(point: &[f32], centroids: &[f32], k: usize, d: usize) -> (f32, usize) {
     let mut best = None;
-    let mut consider = |candidate| {
+    let mut consider = |candidate: (f32, usize)| {
         if best
             .as_ref()
             .is_none_or(|current| compare_distance_then_index(&candidate, current).is_lt())
@@ -993,7 +1215,16 @@ pub fn find_topk(
         let (distance, index) = find_top1(point, centroids, k, d);
         return (vec![index], vec![distance]);
     }
-    let mut dists = Vec::with_capacity(k);
+    let bounded = use_bounded_direct_topk(k, nprobe, rayon::current_num_threads());
+    let mut dists = Vec::with_capacity(if bounded { 0 } else { k });
+    let mut heap = BinaryHeap::with_capacity(if bounded { nprobe } else { 0 });
+    let mut consider = |candidate: (f32, usize)| {
+        if bounded {
+            push_bounded_topk(&mut heap, nprobe, DistanceIndex(candidate.0, candidate.1));
+        } else {
+            dists.push(candidate);
+        }
+    };
     let four_end = k / 4 * 4;
     for c in (0..four_end).step_by(4) {
         let distances = fvec_l2sqr_four(
@@ -1003,14 +1234,20 @@ pub fn find_topk(
             &centroids[(c + 2) * d..(c + 3) * d],
             &centroids[(c + 3) * d..(c + 4) * d],
         );
-        dists.extend(
-            distances
-                .into_iter()
-                .enumerate()
-                .map(|(offset, distance)| (distance, c + offset)),
+        for (offset, distance) in distances.into_iter().enumerate() {
+            consider((distance, c + offset));
+        }
+    }
+    for c in four_end..k {
+        consider((fvec_l2sqr(point, &centroids[c * d..(c + 1) * d]), c));
+    }
+    if bounded {
+        let top = heap.into_sorted_vec();
+        return (
+            top.iter().map(|candidate| candidate.1).collect(),
+            top.iter().map(|candidate| candidate.0).collect(),
         );
     }
-    dists.extend((four_end..k).map(|c| (fvec_l2sqr(point, &centroids[c * d..(c + 1) * d]), c)));
     select_topk_prefix(&mut dists, nprobe);
     let indices: Vec<usize> = dists[..nprobe].iter().map(|&(_, i)| i).collect();
     let distances: Vec<f32> = dists[..nprobe].iter().map(|&(d, _)| d).collect();
@@ -1090,17 +1327,20 @@ pub(crate) fn find_topk_batch_with_centroid_norms(
 /// Upper bound on the largest centroid norm from the f32 squared norms.
 fn centroid_norm_upper(c_norms: &[f32], d: usize) -> f64 {
     let max = c_norms.iter().copied().fold(0.0f32, f32::max) as f64;
-    (max / (1.0 - gamma_f32(d))).sqrt()
+    ((max + 2.0 * d as f64 * f32::MIN_POSITIVE as f64) / (1.0 - gamma_f32(d))).sqrt()
 }
 
 /// Bound on `|fl(|x|² + |c|² - 2 x·c) - |x - c|²|` for a row of f32 squared
 /// norm `x_norm` and centroids of norm at most `c_max`: the two norms and the
 /// inner product each carry the standard `γ_d` dot-product rounding, the two
-/// combining operations one rounding each.
+/// combining operations one rounding each. The absolute terms cover gradual
+/// underflow and FTZ; certification assumes DAZ is disabled (Rust's default).
 fn gemm_error(x_norm: f32, c_max: f64, d: usize) -> f64 {
-    let x_up = (x_norm as f64 / (1.0 - gamma_f32(d))).sqrt();
+    let min_normal = f32::MIN_POSITIVE as f64;
+    let x_up = ((x_norm as f64 + 2.0 * d as f64 * min_normal) / (1.0 - gamma_f32(d))).sqrt();
     let sum = x_up + c_max;
-    gamma_f32(d + 2) * sum * sum
+    gamma_f32(d.saturating_add(2)) * sum * sum
+        + d.saturating_mul(8).saturating_add(4) as f64 * min_normal
 }
 
 fn gamma_f32(operations: usize) -> f64 {
@@ -1113,10 +1353,12 @@ fn gamma_f32(operations: usize) -> f64 {
 }
 
 fn certified_error(e_gemm: f64, kth: f64, d: usize) -> f64 {
-    let gamma = gamma_f32(d + 3);
+    let gamma = gamma_f32(d.saturating_add(3));
     let denominator = 1.0 - 2.0 * gamma;
     if denominator > 0.0 {
-        (e_gemm * (1.0 + gamma) + gamma * kth) / denominator
+        let direct_absolute_error =
+            d.saturating_mul(3).saturating_add(1) as f64 * f32::MIN_POSITIVE as f64;
+        (e_gemm * (1.0 + gamma) + gamma * kth + direct_absolute_error) / denominator
     } else {
         f64::INFINITY
     }
@@ -1146,7 +1388,8 @@ fn direct_distances(x: &[f32], centroids: &[f32], d: usize, slots: &mut [(f32, u
 /// Top-`nprobe` centroids of one row from its SGEMM inner products, with the
 /// contract of `find_topk` (direct `fvec_l2sqr` distances, ties by index).
 ///
-/// With `E` chosen so `E = gemm_error + γ(d+3)·(D + 2E + gemm_error)`
+/// With `E` chosen so
+/// `E = gemm_error + γ(d+3)·(D + 2E + gemm_error) + (3d+1)·MIN_POSITIVE`
 /// and `D` the `nprobe`-th SGEMM distance, every candidate through `D + 2E`
 /// is within `E` of its direct distance: a centroid whose SGEMM distance is
 /// below `D - 2E` is in the direct top-`nprobe` set and one above `D + 2E`
@@ -1456,12 +1699,51 @@ mod tests {
         let error = certified_error(e_gemm, kth, d);
         let upper = kth + 2.0 * error;
 
-        assert!(error >= e_gemm + gamma * (upper + e_gemm));
+        let direct_absolute_error = (3 * d + 1) as f64 * f32::MIN_POSITIVE as f64;
+        assert!(error >= e_gemm + gamma * (upper + e_gemm) + direct_absolute_error);
     }
 
     #[test]
     fn test_certified_error_falls_back_when_fixed_point_diverges() {
         assert!(certified_error(1.0, 1.0, 6_000_000).is_infinite());
+    }
+
+    #[test]
+    fn test_subnormal_batch_topk_matches_direct() {
+        let query = [f32::from_bits(2646992242)];
+        let centroids = [
+            497491591, 451116127, 476312835, 503292106, 505618023, 2646911911, 2618864963,
+            2647061976, 483230981, 500562856, 502683715, 504768900, 2632103736, 2648519606,
+            2634666709, 2629586502,
+        ]
+        .map(f32::from_bits);
+        let queries = query.repeat(8);
+        let (batch, batch_distances) =
+            pool(1).install(|| find_topk_batch(&queries, 8, &centroids, 16, 1, 1));
+        let (direct, direct_distances) = find_topk(&query, &centroids, 16, 1, 1);
+
+        assert_eq!(direct, [5]);
+        assert_eq!(batch, vec![direct; 8]);
+        assert_eq!(batch_distances, vec![direct_distances; 8]);
+    }
+
+    #[test]
+    fn test_subnormal_batch_topk_band_matches_direct() {
+        let query = [f32::from_bits(500581713)];
+        let centroids = [
+            495350057, 2636893317, 2635975005, 2651790365, 500667861, 2643010036, 495349473,
+            488134825, 487899297, 502064699, 2649052619, 2645746487, 506974333, 2651576280,
+            2645106766, 487307224,
+        ]
+        .map(f32::from_bits);
+        let queries = query.repeat(8);
+        let (batch, batch_distances) =
+            pool(1).install(|| find_topk_batch(&queries, 8, &centroids, 16, 1, 3));
+        let (direct, direct_distances) = find_topk(&query, &centroids, 16, 1, 3);
+
+        assert_eq!(direct, [4, 9, 0]);
+        assert_eq!(batch, vec![direct; 8]);
+        assert_eq!(batch_distances, vec![direct_distances; 8]);
     }
 
     /// Sequential scalar reference for cluster assignment. Mirrors the
@@ -1626,6 +1908,51 @@ mod tests {
             assignment_block_plan(rows, 32, 4096, 32, live_scratch, 32 + 2);
         assert!(packed_parallel);
         assert!(packed_rows * (4096 + 32 + 2) + live_scratch <= MAX_MATRIX_ELEMS / 32);
+    }
+
+    #[test]
+    fn test_tiled_certified_topk_matches_direct() {
+        let (n, k, d, nprobe) = (32, 32_769, 2, 2);
+        let centroids = deterministic_data(k, d, 41);
+        let queries = deterministic_data(n, d, 43);
+        let centroid_norms: Vec<_> = centroids.chunks(d).map(fvec_norm_l2sqr).collect();
+        let mut actual = vec![(Vec::new(), Vec::new()); n];
+
+        pool(32).install(|| {
+            assert_eq!(centroid_tile_size(k, d, nprobe, 32), Some(4096));
+            certified_topk_blocks(
+                &queries,
+                n,
+                &centroids,
+                &centroid_norms,
+                k,
+                d,
+                nprobe,
+                &mut actual,
+                |slot, top| {
+                    slot.0.extend(top.iter().map(|&(_, index)| index));
+                    slot.1.extend(top.iter().map(|&(distance, _)| distance));
+                },
+            );
+        });
+
+        for row in 0..n {
+            let expected = find_topk(&queries[row * d..(row + 1) * d], &centroids, k, d, nprobe);
+            assert_eq!(actual[row].0, expected.0, "row {row} indices differ");
+            assert_eq!(
+                actual[row]
+                    .1
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .1
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "row {row} distances differ"
+            );
+        }
     }
 
     #[test]
@@ -1844,8 +2171,21 @@ mod tests {
     #[test]
     fn test_direct_topk_parallelism_respects_aggregate_scratch_budget() {
         assert!(use_parallel_direct_topk(32, 1_048_576, 1, 32));
-        assert!(!use_parallel_direct_topk(32, 1_048_576, 2, 32));
+        assert!(use_parallel_direct_topk(32, 1_048_576, 2, 32));
         assert!(use_parallel_direct_topk(2, 524_288, 2, 32));
+        assert!(!use_parallel_direct_topk(32, 1_048_576, 1_048_575, 32));
+    }
+
+    #[test]
+    fn test_bounded_direct_topk_preserves_distance_then_index_order() {
+        let k = 32_769;
+        let mut centroids: Vec<f32> = (0..k).map(|i| i as f32).collect();
+        centroids[k - 1] = 1.0;
+
+        let actual = pool(32).install(|| find_topk(&[0.0], &centroids, k, 1, 2));
+
+        assert!(use_bounded_direct_topk(k, 2, 32));
+        assert_eq!(actual, (vec![0, 1], vec![0.0, 1.0]));
     }
 
     #[test]
