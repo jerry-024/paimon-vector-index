@@ -57,6 +57,16 @@ fn use_direct_batch(rows: usize, threads: usize) -> bool {
     rows < DIRECT_ROWS_PER_THREAD.saturating_mul(threads.max(1))
 }
 
+fn use_parallel_direct_topk(nq: usize, k: usize, nprobe: usize, threads: usize) -> bool {
+    if nprobe.min(k) <= 1 {
+        return true;
+    }
+    let tuple_elems = std::mem::size_of::<(f32, usize)>().div_ceil(std::mem::size_of::<f32>());
+    k.saturating_mul(tuple_elems)
+        .saturating_mul(nq.min(threads.max(1)))
+        <= MAX_MATRIX_ELEMS
+}
+
 fn topk_worker_scratch(k: usize, nprobe: usize) -> usize {
     let tuple_elems = std::mem::size_of::<(f32, usize)>().div_ceil(std::mem::size_of::<f32>());
     let tuple_buffers = 1 + usize::from(nprobe > 1 && nprobe < k);
@@ -939,6 +949,35 @@ fn certified_topk_blocks<T: Send>(
     }
 }
 
+fn find_top1(point: &[f32], centroids: &[f32], k: usize, d: usize) -> (f32, usize) {
+    let mut best = None;
+    let mut consider = |candidate| {
+        if best
+            .as_ref()
+            .is_none_or(|current| compare_distance_then_index(&candidate, current).is_lt())
+        {
+            best = Some(candidate);
+        }
+    };
+    let four_end = k / 4 * 4;
+    for c in (0..four_end).step_by(4) {
+        let distances = fvec_l2sqr_four(
+            point,
+            &centroids[c * d..(c + 1) * d],
+            &centroids[(c + 1) * d..(c + 2) * d],
+            &centroids[(c + 2) * d..(c + 3) * d],
+            &centroids[(c + 3) * d..(c + 4) * d],
+        );
+        for (offset, distance) in distances.into_iter().enumerate() {
+            consider((distance, c + offset));
+        }
+    }
+    for c in four_end..k {
+        consider((fvec_l2sqr(point, &centroids[c * d..(c + 1) * d]), c));
+    }
+    best.expect("top-1 requires at least one centroid")
+}
+
 pub fn find_topk(
     point: &[f32],
     centroids: &[f32],
@@ -949,6 +988,10 @@ pub fn find_topk(
     let nprobe = nprobe.min(k);
     if nprobe == 0 {
         return (Vec::new(), Vec::new());
+    }
+    if nprobe == 1 {
+        let (distance, index) = find_top1(point, centroids, k, d);
+        return (vec![index], vec![distance]);
     }
     let mut dists = Vec::with_capacity(k);
     let four_end = k / 4 * 4;
@@ -982,10 +1025,12 @@ fn find_topk_batch_direct(
     d: usize,
     nprobe: usize,
 ) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
-    (0..nq)
-        .into_par_iter()
-        .map(|qi| find_topk(&queries[qi * d..(qi + 1) * d], centroids, k, d, nprobe))
-        .unzip()
+    let search = |qi| find_topk(&queries[qi * d..(qi + 1) * d], centroids, k, d, nprobe);
+    if use_parallel_direct_topk(nq, k, nprobe, rayon::current_num_threads()) {
+        (0..nq).into_par_iter().map(search).unzip()
+    } else {
+        (0..nq).map(search).unzip()
+    }
 }
 
 /// Batch find top-nprobe nearest centroids for multiple queries.
@@ -1786,6 +1831,21 @@ mod tests {
         let query = [1.0, 1.0];
         let (indices, _) = find_topk(&query, &centroids, 3, 2, 2);
         assert_eq!(indices[0], 0);
+    }
+
+    #[test]
+    fn test_find_top1_without_full_scratch_preserves_direct_order() {
+        let centroids = [1.0, 0.0, -1.0, 0.0, 2.0, 0.0];
+        let query = [0.0, 0.0];
+
+        assert_eq!(find_top1(&query, &centroids, 3, 2), (1.0, 0));
+    }
+
+    #[test]
+    fn test_direct_topk_parallelism_respects_aggregate_scratch_budget() {
+        assert!(use_parallel_direct_topk(32, 1_048_576, 1, 32));
+        assert!(!use_parallel_direct_topk(32, 1_048_576, 2, 32));
+        assert!(use_parallel_direct_topk(2, 524_288, 2, 32));
     }
 
     #[test]
