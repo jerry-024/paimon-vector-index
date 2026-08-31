@@ -2023,15 +2023,7 @@ mod tests {
                 1,
             );
             let direct_rows = CERTIFIED_SGEMM_ROWS.with(|count| count.get().unwrap());
-            find_topk_batch_with_centroid_norms(
-                &queries,
-                8,
-                &centroids,
-                &centroid_norms,
-                2,
-                d,
-                1,
-            );
+            find_topk_batch_with_centroid_norms(&queries, 8, &centroids, &centroid_norms, 2, d, 1);
             let blocked_rows = CERTIFIED_SGEMM_ROWS.with(|count| count.replace(None).unwrap());
             (direct_rows, blocked_rows)
         });
@@ -2589,14 +2581,17 @@ mod tests {
 
     #[test]
     fn test_mixed_block_sgemm_only_processes_safe_rows() {
-        let centroids = [-1.0, 1.0];
-        let queries: Vec<f32> = (0..32)
-            .map(|row| if row % 2 == 0 { 10.0 } else { f32::NAN })
-            .collect();
+        let d = MIN_GEMM_DIM;
+        let mut centroids = vec![-1.0; 2 * d];
+        centroids[d..].fill(1.0);
+        let mut queries = vec![10.0; 32 * d];
+        for row in (1..32).step_by(2) {
+            queries[row * d] = f32::NAN;
+        }
 
         let (nearest, gemm_rows) = pool(1).install(|| {
             CERTIFIED_SGEMM_ROWS.with(|count| count.set(Some(0)));
-            let nearest = find_nearest_batch(&queries, 32, &centroids, 2, 1);
+            let nearest = find_nearest_batch(&queries, 32, &centroids, 2, d);
             let rows = CERTIFIED_SGEMM_ROWS.with(|count| count.replace(None).unwrap());
             (nearest, rows)
         });
