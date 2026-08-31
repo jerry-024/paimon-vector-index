@@ -93,6 +93,15 @@ fn use_direct_batch(rows: usize, d: usize, threads: usize) -> bool {
     d < MIN_GEMM_DIM || rows < DIRECT_ROWS_PER_THREAD.saturating_mul(threads.max(1))
 }
 
+fn direct_topk_linear_worker_limit(k: usize, nprobe: usize, workers: usize) -> usize {
+    let tuples = if nprobe <= 1 { 1 } else { k };
+    let per_worker = tuples.saturating_mul(topk_tuple_elems());
+    if per_worker == 0 {
+        return 0;
+    }
+    (MAX_MATRIX_ELEMS / per_worker).min(workers)
+}
+
 fn use_parallel_direct_topk(nq: usize, k: usize, nprobe: usize, threads: usize) -> bool {
     let nprobe = nprobe.min(k);
     let workers = nq.min(threads.max(1)).max(1);
@@ -1318,8 +1327,35 @@ fn find_topk_batch_direct(
     nprobe: usize,
 ) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
     let threads = rayon::current_num_threads();
+    let requested_workers = nq.min(threads).max(1);
+    // Keep the faster linear selection and run excess queries in bounded waves
+    // instead of switching algorithms when nq crosses the scratch limit.
+    let linear_workers = direct_topk_linear_worker_limit(k, nprobe, requested_workers);
+    if linear_workers > 0 {
+        let wave = requested_workers.min(linear_workers);
+        let mut out = vec![(Vec::new(), Vec::new()); nq];
+        for start in (0..nq).step_by(wave) {
+            let end = (start + wave).min(nq);
+            let query_chunk = &queries[start * d..end * d];
+            out[start..end]
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(qi, slot)| {
+                    *slot = find_topk_with_workers(
+                        &query_chunk[qi * d..(qi + 1) * d],
+                        centroids,
+                        k,
+                        d,
+                        nprobe,
+                        wave,
+                    );
+                });
+        }
+        return out.into_iter().unzip();
+    }
+
     let parallel = use_parallel_direct_topk(nq, k, nprobe, threads);
-    let workers = if parallel { nq.min(threads).max(1) } else { 1 };
+    let workers = if parallel { requested_workers } else { 1 };
     let search = |qi| {
         find_topk_with_workers(
             &queries[qi * d..(qi + 1) * d],
@@ -1535,7 +1571,7 @@ fn certified_topk_row<'a>(
     }
     if nprobe >= k {
         direct_distances(x, centroids, d, dists);
-        dists.sort_by(compare_distance_then_index);
+        dists.sort_unstable_by(compare_distance_then_index);
         return &dists[..];
     }
     // Partition so [..nprobe] holds the nprobe smallest and [nprobe] the next.
@@ -1549,7 +1585,7 @@ fn certified_topk_row<'a>(
     let upper = kth + 2.0 * e;
     if next > upper {
         direct_distances(x, centroids, d, &mut dists[..nprobe]);
-        dists[..nprobe].sort_by(compare_distance_then_index);
+        dists[..nprobe].sort_unstable_by(compare_distance_then_index);
         return &dists[..nprobe];
     }
     let lower = kth - 2.0 * e;
@@ -1575,7 +1611,7 @@ fn certified_topk_row<'a>(
     select_topk_prefix(&mut band, slots);
     dists[certain..nprobe].copy_from_slice(&band[..slots]);
     direct_distances(x, centroids, d, &mut dists[..certain]);
-    dists[..nprobe].sort_by(compare_distance_then_index);
+    dists[..nprobe].sort_unstable_by(compare_distance_then_index);
     &dists[..nprobe]
 }
 
@@ -1584,7 +1620,9 @@ fn select_topk_prefix(dists: &mut [(f32, usize)], nprobe: usize) {
     if nprobe < dists.len() {
         dists.select_nth_unstable_by(nprobe - 1, compare_distance_then_index);
     }
-    dists[..nprobe].sort_by(compare_distance_then_index);
+    // Centroid indices make this comparator a total order, so stable sorting
+    // is unnecessary and would allocate additional scratch space.
+    dists[..nprobe].sort_unstable_by(compare_distance_then_index);
 }
 
 fn compare_distance_then_index(left: &(f32, usize), right: &(f32, usize)) -> std::cmp::Ordering {
@@ -2283,6 +2321,24 @@ mod tests {
         assert!(use_parallel_direct_topk(32, 1_048_576, 2, 32));
         assert!(use_parallel_direct_topk(2, 524_288, 2, 32));
         assert!(!use_parallel_direct_topk(32, 1_048_576, 1_048_575, 32));
+    }
+
+    #[test]
+    fn test_direct_topk_linear_workers_are_capped_without_switching_algorithm() {
+        let k = 262_144;
+        let nprobe = 65_536;
+        assert_eq!(direct_topk_linear_worker_limit(k, nprobe, 4), 4);
+        assert_eq!(direct_topk_linear_worker_limit(k, nprobe, 5), 4);
+        assert!(!use_bounded_direct_topk(k, nprobe, 4));
+        assert!(use_bounded_direct_topk(k, nprobe, 5));
+    }
+
+    #[test]
+    fn test_direct_topk_waves_support_zero_dimension() {
+        assert_eq!(
+            find_topk_batch(&[], 3, &[], 0, 0, 1),
+            (vec![Vec::new(); 3], vec![Vec::new(); 3])
+        );
     }
 
     #[test]
