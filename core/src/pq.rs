@@ -17,8 +17,7 @@
 
 use crate::blas::sgemm_a_bt;
 use crate::distance::{
-    fvec_ip_batch, fvec_l2sqr, fvec_l2sqr_batch, fvec_norm_l2sqr, pq_distance_from_table,
-    MetricType,
+    fvec_ip_batch, fvec_l2sqr_batch, fvec_norm_l2sqr, pq_distance_from_table, MetricType,
 };
 use crate::kmeans::{self, KMeansConfig};
 use rayon::prelude::*;
@@ -417,10 +416,10 @@ impl ProductQuantizer {
                     let dsub = q.len();
                     let base = self.centroid_chunk_base(sub);
                     let mut best = 0;
-                    let mut best_dist = fvec_l2sqr(q, &self.centroids[base..base + dsub]);
+                    let mut best_dist = fvec_l2sqr_fma(q, &self.centroids[base..base + dsub]);
                     for j in 1..self.ksub {
                         let offset = base + j * dsub;
-                        let dist = fvec_l2sqr(q, &self.centroids[offset..offset + dsub]);
+                        let dist = fvec_l2sqr_fma(q, &self.centroids[offset..offset + dsub]);
                         if dist < best_dist {
                             best = j;
                             best_dist = dist;
@@ -650,6 +649,20 @@ const ENCODE_TRANSPOSE_MIN_ROWS: usize = 32;
 fn encode_block_rows(rows: usize, workers: usize) -> usize {
     rows.div_ceil(workers.max(1))
         .clamp(32, MAX_ENCODE_BLOCK_ROWS)
+}
+
+/// Squared L2 with the same accumulation order as the transposed kernels.
+#[inline]
+fn fvec_l2sqr_fma(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert!(!a.is_empty());
+    let diff = a[0] - b[0];
+    let mut sum = diff * diff;
+    for i in 1..a.len() {
+        let diff = a[i] - b[i];
+        sum = diff.mul_add(diff, sum);
+    }
+    sum
 }
 
 /// Squared-L2 argmin over a transposed sub-codebook.
@@ -1063,6 +1076,23 @@ mod tests {
 
             assert!(codes.iter().all(|&code| code == 1), "n={n}");
         }
+    }
+
+    #[test]
+    fn test_encode_batch_blocked_is_batch_invariant() {
+        let mut pq = ProductQuantizer::new(4, 1);
+        pq.centroids = vec![100.0; pq.d * pq.ksub];
+        // Plain summation ties these centroids; FMA sees code 1 one ulp closer.
+        pq.centroids[0..4].copy_from_slice(&[0.3658799, 0.06077051, -0.46501994, -0.31766486]);
+        pq.centroids[4..8].copy_from_slice(&[0.3658799, 0.06077051, -0.46501994, -0.31766483]);
+
+        let mut small = vec![0; 31];
+        pq.encode_batch_blocked(&[0.0; 31 * 4], 31, &mut small);
+        let mut large = vec![0; 32];
+        pq.encode_batch_blocked(&[0.0; 32 * 4], 32, &mut large);
+
+        assert_eq!(small.as_slice(), &large[..31]);
+        assert!(large.iter().all(|&code| code == 1));
     }
 
     #[test]
