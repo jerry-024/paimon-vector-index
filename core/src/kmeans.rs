@@ -857,7 +857,7 @@ pub(crate) fn find_nearest_batch(
     let c_norms: Vec<f32> = (0..k)
         .map(|c| fvec_norm_l2sqr(&centroids[c * d..(c + 1) * d]))
         .collect();
-    let mut out = vec![0usize; n];
+    let mut out = vec![k; n];
     certified_topk_blocks(
         data,
         n,
@@ -867,8 +867,15 @@ pub(crate) fn find_nearest_batch(
         d,
         1,
         &mut out,
-        |slot, top| *slot = top[0].1,
+        |slot, top| {
+            if top[0].0 < f32::MAX {
+                *slot = top[0].1;
+            }
+        },
     );
+    for (i, assignment) in out.iter_mut().enumerate().filter(|(_, c)| **c == k) {
+        *assignment = find_nearest(&data[i * d..(i + 1) * d], centroids, k, d);
+    }
     out
 }
 
@@ -1363,7 +1370,7 @@ pub(crate) fn find_topk_batch_with_centroid_norms(
     if nprobe == 0 {
         return (vec![Vec::new(); nq], vec![Vec::new(); nq]);
     }
-    if use_direct_batch(nq, d, rayon::current_num_threads()) {
+    if nprobe == k || use_direct_batch(nq, d, rayon::current_num_threads()) {
         return find_topk_batch_direct(queries, nq, centroids, k, d, nprobe);
     }
     let mut out: Vec<(Vec<usize>, Vec<f32>)> = vec![(Vec::new(), Vec::new()); nq];
@@ -2631,6 +2638,42 @@ mod tests {
         let queries = [query, query];
 
         assert_eq!(find_nearest_batch(&queries, 2, &centroids, 2, 1), [1, 1]);
+    }
+
+    #[test]
+    fn test_non_finite_nearest_batch_matches_scalar() {
+        let d = MIN_GEMM_DIM;
+        let query = vec![f32::INFINITY; d];
+        let mut centroids = vec![f32::INFINITY; 2 * d];
+        centroids[d..].fill(0.0);
+        let expected = find_nearest(&query, &centroids, 2, d);
+
+        assert_eq!(
+            pool(1).install(|| find_nearest_batch(&query.repeat(8), 8, &centroids, 2, d)),
+            vec![expected; 8]
+        );
+    }
+
+    #[test]
+    fn test_batch_topk_all_centroids_skips_sgemm() {
+        let d = MIN_GEMM_DIM;
+        let k = 64;
+        let nq = DIRECT_ROWS_PER_THREAD;
+        let mut centroids = vec![-1.0; k * d];
+        centroids[k / 2 * d..].fill(1.0);
+        let query = vec![10.0; d];
+        let expected = find_topk(&query, &centroids, k, d, k);
+
+        let ((indices, distances), gemm_rows) = pool(1).install(|| {
+            CERTIFIED_SGEMM_ROWS.with(|count| count.set(Some(0)));
+            let result = find_topk_batch(&query.repeat(nq), nq, &centroids, k, d, k);
+            let rows = CERTIFIED_SGEMM_ROWS.with(|count| count.replace(None).unwrap());
+            (result, rows)
+        });
+
+        assert_eq!(indices, vec![expected.0; nq]);
+        assert_eq!(distances, vec![expected.1; nq]);
+        assert_eq!(gemm_rows, 0);
     }
 
     #[test]
