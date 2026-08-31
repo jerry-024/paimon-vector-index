@@ -95,7 +95,8 @@ fn use_direct_batch(rows: usize, d: usize, threads: usize) -> bool {
 
 fn use_parallel_direct_topk(nq: usize, k: usize, nprobe: usize, threads: usize) -> bool {
     let nprobe = nprobe.min(k);
-    let tuples = if use_bounded_direct_topk(k, nprobe, threads) {
+    let workers = nq.min(threads.max(1)).max(1);
+    let tuples = if use_bounded_direct_topk(k, nprobe, workers) {
         nprobe
     } else if nprobe <= 1 {
         1
@@ -104,7 +105,7 @@ fn use_parallel_direct_topk(nq: usize, k: usize, nprobe: usize, threads: usize) 
     };
     tuples
         .saturating_mul(topk_tuple_elems())
-        .saturating_mul(nq.min(threads.max(1)))
+        .saturating_mul(workers)
         <= MAX_MATRIX_ELEMS
 }
 
@@ -910,6 +911,11 @@ fn certified_topk_blocks<T: Send>(
     }
     let topk_scratch = topk_worker_scratch(k, nprobe);
     let (block_rows, parallel) = assignment_block_plan(n, d, k, threads, topk_scratch, 2);
+    let direct_workers = if parallel {
+        n.div_ceil(block_rows).min(threads).max(1)
+    } else {
+        1
+    };
     let block = |(b, chunk): (usize, &mut [T])| {
         let start = b * block_rows;
         let rows = chunk.len();
@@ -943,6 +949,7 @@ fn certified_topk_blocks<T: Send>(
                     c_max,
                     d,
                     nprobe,
+                    direct_workers,
                     &mut dists,
                 );
                 emit(slot, top);
@@ -953,7 +960,8 @@ fn certified_topk_blocks<T: Send>(
         for (i, slot) in chunk.iter_mut().enumerate() {
             if !use_gemm[i] {
                 let x_i = &x[i * d..(i + 1) * d];
-                let (ids, distances) = find_topk(x_i, centroids, k, d, nprobe);
+                let (ids, distances) =
+                    find_topk_with_workers(x_i, centroids, k, d, nprobe, direct_workers);
                 dists.clear();
                 dists.extend(distances.into_iter().zip(ids));
                 emit(slot, &dists);
@@ -997,6 +1005,7 @@ fn certified_topk_blocks<T: Send>(
                     c_max,
                     d,
                     nprobe,
+                    direct_workers,
                     &mut dists,
                 );
                 emit(&mut chunk[row], top);
@@ -1055,6 +1064,11 @@ fn certified_topk_blocks_tiled<T: Send>(
         .saturating_mul(d)
         .saturating_mul(2);
     let parallel = planned_parallel || (threads > 1 && block_flops >= MIN_BLOCK_FLOPS);
+    let direct_workers = if parallel {
+        n.div_ceil(block_rows).min(threads).max(1)
+    } else {
+        1
+    };
     let block = |(b, chunk): (usize, &mut [T])| {
         let start = b * block_rows;
         let rows = chunk.len();
@@ -1072,7 +1086,8 @@ fn certified_topk_blocks_tiled<T: Send>(
             if 2.0 * e_gemm < to_mean {
                 safe_indices.push(row);
             } else {
-                let (ids, distances) = find_topk(x_i, centroids, k, d, nprobe);
+                let (ids, distances) =
+                    find_topk_with_workers(x_i, centroids, k, d, nprobe, direct_workers);
                 direct.clear();
                 direct.extend(distances.into_iter().zip(ids));
                 emit(slot, &direct);
@@ -1159,7 +1174,8 @@ fn certified_topk_blocks_tiled<T: Send>(
             let slot = &mut chunk[row];
             if !valid || approximate_top.len() < nprobe || exact_top.len() < nprobe {
                 let x_i = &x[row * d..(row + 1) * d];
-                let (ids, distances) = find_topk(x_i, centroids, k, d, nprobe);
+                let (ids, distances) =
+                    find_topk_with_workers(x_i, centroids, k, d, nprobe, direct_workers);
                 direct.clear();
                 direct.extend(distances.into_iter().zip(ids));
                 emit(slot, &direct);
@@ -1216,6 +1232,18 @@ pub fn find_topk(
     d: usize,
     nprobe: usize,
 ) -> (Vec<usize>, Vec<f32>) {
+    find_topk_with_workers(point, centroids, k, d, nprobe, 1)
+}
+
+#[inline]
+fn find_topk_with_workers(
+    point: &[f32],
+    centroids: &[f32],
+    k: usize,
+    d: usize,
+    nprobe: usize,
+    workers: usize,
+) -> (Vec<usize>, Vec<f32>) {
     let nprobe = nprobe.min(k);
     if nprobe == 0 {
         return (Vec::new(), Vec::new());
@@ -1224,7 +1252,18 @@ pub fn find_topk(
         let (distance, index) = find_top1(point, centroids, k, d);
         return (vec![index], vec![distance]);
     }
-    let bounded = use_bounded_direct_topk(k, nprobe, rayon::current_num_threads());
+    find_topk_multiple(point, centroids, k, d, nprobe, workers)
+}
+
+fn find_topk_multiple(
+    point: &[f32],
+    centroids: &[f32],
+    k: usize,
+    d: usize,
+    nprobe: usize,
+    workers: usize,
+) -> (Vec<usize>, Vec<f32>) {
+    let bounded = use_bounded_direct_topk(k, nprobe, workers);
     let mut dists = Vec::with_capacity(if bounded { 0 } else { k });
     let mut heap = BinaryHeap::with_capacity(if bounded { nprobe } else { 0 });
     let mut consider = |candidate: (f32, usize)| {
@@ -1271,8 +1310,20 @@ fn find_topk_batch_direct(
     d: usize,
     nprobe: usize,
 ) -> (Vec<Vec<usize>>, Vec<Vec<f32>>) {
-    let search = |qi| find_topk(&queries[qi * d..(qi + 1) * d], centroids, k, d, nprobe);
-    if use_parallel_direct_topk(nq, k, nprobe, rayon::current_num_threads()) {
+    let threads = rayon::current_num_threads();
+    let parallel = use_parallel_direct_topk(nq, k, nprobe, threads);
+    let workers = if parallel { nq.min(threads).max(1) } else { 1 };
+    let search = |qi| {
+        find_topk_with_workers(
+            &queries[qi * d..(qi + 1) * d],
+            centroids,
+            k,
+            d,
+            nprobe,
+            workers,
+        )
+    };
+    if parallel {
         (0..nq).into_par_iter().map(search).unzip()
     } else {
         (0..nq).map(search).unzip()
@@ -1417,6 +1468,7 @@ fn certified_topk_row<'a>(
     c_max: f64,
     d: usize,
     nprobe: usize,
+    direct_workers: usize,
     dists: &'a mut Vec<(f32, usize)>,
 ) -> &'a [(f32, usize)] {
     let k = c_norms.len();
@@ -1430,7 +1482,8 @@ fn certified_topk_row<'a>(
         for c in 0..k {
             let approximate = x_norm + c_norms[c] - 2.0 * ip[c];
             if !approximate.is_finite() {
-                let (ids, distances) = find_topk(x, centroids, k, d, nprobe);
+                let (ids, distances) =
+                    find_topk_with_workers(x, centroids, k, d, nprobe, direct_workers);
                 dists.extend(distances.into_iter().zip(ids));
                 return dists;
             }
@@ -1465,7 +1518,8 @@ fn certified_topk_row<'a>(
     for c in 0..k {
         let approximate = x_norm + c_norms[c] - 2.0 * ip[c];
         if !approximate.is_finite() {
-            let (ids, distances) = find_topk(x, centroids, k, d, nprobe);
+            let (ids, distances) =
+                find_topk_with_workers(x, centroids, k, d, nprobe, direct_workers);
             dists.clear();
             dists.extend(distances.into_iter().zip(ids));
             return dists;
