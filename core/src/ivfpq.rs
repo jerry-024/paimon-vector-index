@@ -25,14 +25,21 @@ use crate::kmeans::{self, KMeansConfig};
 use crate::logging::{emit_log, LogLevel};
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
+use crate::projected_assign::{CoarseProjection, ProjectedAssignment};
 use crate::sparse_table::SparseTable;
 use rayon::prelude::*;
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+const PARALLEL_PREPROCESS_MIN_VALUES: usize = 65_536;
+
+fn should_parallelize_preprocessing(nq: usize, d: usize) -> bool {
+    nq.saturating_mul(d) >= PARALLEL_PREPROCESS_MIN_VALUES
+}
 
 pub trait RowIdFilter: Sync {
     fn contains(&self, id: i64) -> bool;
@@ -66,7 +73,7 @@ pub struct IVFPQIndex {
     pub metric: MetricType,
     pub by_residual: bool,
 
-    pub quantizer_centroids: Vec<f32>,
+    pub(crate) quantizer_centroids: Vec<f32>,
     pub pq: ProductQuantizer,
     pub opq: Option<OPQMatrix>,
 
@@ -78,6 +85,16 @@ pub struct IVFPQIndex {
     precomputed_table: Vec<f32>,
     /// Block-layout packed codes for 4-bit FastScan. One per list.
     fastscan_codes: Vec<Vec<u8>>,
+    /// Build-only PCA projection of the coarse centroids that lets `add`
+    /// find the exact nearest centroid with a lower-bound branch-and-bound
+    /// instead of a full scan. Derived from the centroids in `train`, shared
+    /// by `from_trained`, never serialized.
+    coarse_projection: Option<Arc<CoarseProjection>>,
+    /// Strided sample of the training vectors (centroid space) used to
+    /// calibrate the projection width; kept so the projection can be refit
+    /// when the centroids or the mode change after training.
+    calibration_sample: Option<Arc<[f32]>>,
+    pub(crate) projected_assignment: ProjectedAssignment,
 }
 
 impl IVFPQIndex {
@@ -114,7 +131,53 @@ impl IVFPQIndex {
             codes: vec![Vec::new(); nlist],
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
+            coarse_projection: None,
+            calibration_sample: None,
+            projected_assignment: ProjectedAssignment::Auto,
         }
+    }
+
+    pub fn with_projected_assignment(mut self, mode: ProjectedAssignment) -> Self {
+        self.set_projected_assignment(mode);
+        self
+    }
+
+    /// Choose how `add` finds the nearest coarse centroid. Takes effect on the
+    /// next `train`; on an already trained index the projection is rebuilt
+    /// (or dropped) immediately. Every mode yields the exact nearest centroid.
+    pub(crate) fn set_projected_assignment(&mut self, mode: ProjectedAssignment) {
+        self.projected_assignment = mode;
+        if !self.quantizer_centroids.is_empty() {
+            self.rebuild_coarse_projection();
+        } else {
+            self.coarse_projection = None;
+        }
+    }
+
+    pub fn coarse_projection(&self) -> Option<&CoarseProjection> {
+        self.coarse_projection.as_deref()
+    }
+
+    pub fn quantizer_centroids(&self) -> &[f32] {
+        &self.quantizer_centroids
+    }
+
+    /// Replace the coarse centroids (`nlist × d` values) before vectors are
+    /// added. Drops the precomputed search table and refits the build-only
+    /// projection, so a subsequent `add` assigns against the new centroids.
+    pub fn set_quantizer_centroids(&mut self, centroids: Vec<f32>) {
+        assert_eq!(
+            centroids.len(),
+            self.nlist * self.d,
+            "quantizer centroids must hold nlist * d values"
+        );
+        assert!(
+            self.ids.iter().all(Vec::is_empty),
+            "cannot replace quantizer centroids after vectors have been added"
+        );
+        self.quantizer_centroids = centroids;
+        self.precomputed_table.clear();
+        self.rebuild_coarse_projection();
     }
 
     /// Create an index with automatic nlist based on target partition size.
@@ -165,10 +228,14 @@ impl IVFPQIndex {
             codes: vec![Vec::new(); trained.nlist],
             precomputed_table: Vec::new(),
             fastscan_codes: Vec::new(),
+            coarse_projection: trained.coarse_projection.clone(),
+            calibration_sample: trained.calibration_sample.clone(),
+            projected_assignment: trained.projected_assignment,
         }
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
+        self.coarse_projection = None;
         let d = self.d;
 
         let train_data = if self.metric == MetricType::Cosine {
@@ -200,12 +267,54 @@ impl IVFPQIndex {
         // Retrain PQ on the exact distribution that add/search will encode.
         // For OPQ: opq.train() trained PQ on centered data, but add/search
         // encode uncentered vectors, so we must retrain here for all metrics.
+        let calibration = calibration_sample(&effective_data, n, d);
         let pq_train_data = if self.by_residual {
             compute_residuals(&effective_data, n, d, &self.quantizer_centroids, self.nlist)
         } else {
             effective_data
         };
         self.pq.train(&pq_train_data, n);
+        self.calibration_sample = Some(Arc::from(calibration));
+        self.rebuild_coarse_projection();
+    }
+
+    /// Fit the build-only centroid projection used by `add` from the current
+    /// centroids and the calibration sample kept from training. Auto mode
+    /// keeps it only when it measures faster than the exact scan on that
+    /// sample; the result is exact either way.
+    fn rebuild_coarse_projection(&mut self) {
+        self.coarse_projection = None;
+        let force = match self.projected_assignment {
+            ProjectedAssignment::Disabled => return,
+            ProjectedAssignment::Enabled => true,
+            ProjectedAssignment::Auto => false,
+        };
+        let sample: &[f32] = self.calibration_sample.as_deref().unwrap_or(&[]);
+        let projection = CoarseProjection::train(
+            &self.quantizer_centroids,
+            self.nlist,
+            self.d,
+            force,
+            sample,
+            sample.len() / self.d.max(1),
+        );
+        match &projection {
+            Some(p) => emit_log(
+                LogLevel::Info,
+                &format!(
+                    "IVF-PQ projected assignment enabled: d'={} of d={} ({:.1}% centroid variance)",
+                    p.dimension(),
+                    self.d,
+                    p.explained_variance() * 100.0
+                ),
+            ),
+            None if force => emit_log(
+                LogLevel::Warn,
+                "IVF-PQ projected assignment requested but the centroids admit no projection; using the exact scan",
+            ),
+            None => {}
+        }
+        self.coarse_projection = projection.map(Arc::new);
     }
 
     /// Add vectors in batches (Faiss-style: batch assign → batch residual → batch encode).
@@ -228,9 +337,16 @@ impl IVFPQIndex {
 
         // L2/IP without OPQ borrows the caller's batch instead of copying it.
         let processed = self.preprocess_queries(data, n);
-        let assignments =
-            kmeans::find_nearest_batch(&processed, n, &self.quantizer_centroids, self.nlist, d);
-
+        // Both branches return the exact nearest centroid; the projection only
+        // prunes the scan (see `projected_assign`).
+        let assignments = match &self.coarse_projection {
+            Some(projection) => {
+                projection.assign(&processed, n, &self.quantizer_centroids, self.nlist)
+            }
+            None => {
+                kmeans::find_nearest_batch(&processed, n, &self.quantizer_centroids, self.nlist, d)
+            }
+        };
         let to_encode = if self.by_residual {
             let mut residuals = vec![0.0f32; n * d];
             residuals
@@ -521,9 +637,20 @@ impl IVFPQIndex {
         let d = self.d;
         let processed = match self.metric {
             MetricType::Cosine => {
-                let mut normalized = queries[..nq * d].to_vec();
-                for vector in normalized.chunks_exact_mut(d) {
-                    fvec_normalize(vector);
+                let mut normalized = vec![0.0f32; nq * d];
+                if should_parallelize_preprocessing(nq, d) {
+                    normalized
+                        .par_chunks_exact_mut(d)
+                        .zip(queries[..nq * d].par_chunks_exact(d))
+                        .for_each(|(dst, src)| {
+                            dst.copy_from_slice(src);
+                            fvec_normalize(dst);
+                        });
+                } else {
+                    normalized.copy_from_slice(&queries[..nq * d]);
+                    normalized.chunks_exact_mut(d).for_each(|vector| {
+                        fvec_normalize(vector);
+                    });
                 }
                 Cow::Owned(normalized)
             }
@@ -1251,20 +1378,14 @@ fn scan_codes_transposed_with_scratch(
 fn transposed_column_init(dists: &mut [f32], column: &[u8], table: &[f32], dis0: f32) {
     debug_assert_eq!(dists.len(), column.len());
     if let Ok(table) = <&[f32; 256]>::try_from(table) {
-        let mut dist_chunks = dists.chunks_exact_mut(8);
-        let mut code_chunks = column.chunks_exact(8);
-        for (dist8, code8) in (&mut dist_chunks).zip(&mut code_chunks) {
-            let dist8: &mut [f32; 8] = dist8.try_into().unwrap();
-            let code8: &[u8; 8] = code8.try_into().unwrap();
+        let (dist_chunks, dist_remainder) = dists.as_chunks_mut::<8>();
+        let (code_chunks, code_remainder) = column.as_chunks::<8>();
+        for (dist8, code8) in dist_chunks.iter_mut().zip(code_chunks) {
             for i in 0..8 {
                 dist8[i] = dis0 + table[code8[i] as usize];
             }
         }
-        for (dist, &code) in dist_chunks
-            .into_remainder()
-            .iter_mut()
-            .zip(code_chunks.remainder())
-        {
+        for (dist, &code) in dist_remainder.iter_mut().zip(code_remainder) {
             *dist = dis0 + table[code as usize];
         }
     } else {
@@ -1278,20 +1399,14 @@ fn transposed_column_init(dists: &mut [f32], column: &[u8], table: &[f32], dis0:
 fn transposed_column_add(dists: &mut [f32], column: &[u8], table: &[f32]) {
     debug_assert_eq!(dists.len(), column.len());
     if let Ok(table) = <&[f32; 256]>::try_from(table) {
-        let mut dist_chunks = dists.chunks_exact_mut(8);
-        let mut code_chunks = column.chunks_exact(8);
-        for (dist8, code8) in (&mut dist_chunks).zip(&mut code_chunks) {
-            let dist8: &mut [f32; 8] = dist8.try_into().unwrap();
-            let code8: &[u8; 8] = code8.try_into().unwrap();
+        let (dist_chunks, dist_remainder) = dists.as_chunks_mut::<8>();
+        let (code_chunks, code_remainder) = column.as_chunks::<8>();
+        for (dist8, code8) in dist_chunks.iter_mut().zip(code_chunks) {
             for i in 0..8 {
                 dist8[i] += table[code8[i] as usize];
             }
         }
-        for (dist, &code) in dist_chunks
-            .into_remainder()
-            .iter_mut()
-            .zip(code_chunks.remainder())
-        {
+        for (dist, &code) in dist_remainder.iter_mut().zip(code_remainder) {
             *dist += table[code as usize];
         }
     } else {
@@ -2834,6 +2949,23 @@ fn seed_heaps(heaps: &mut [TopKHeap], seed_ids: &[i64], seed_distances: &[f32], 
 
 // --- Utilities ---
 
+/// Evenly spaced rows of the training data for projection calibration.
+fn calibration_sample(data: &[f32], n: usize, d: usize) -> Vec<f32> {
+    let rows = crate::projected_assign::CALIBRATION_ROWS.min(n);
+    if rows == 0 || d == 0 {
+        return Vec::new();
+    }
+    let quotient = n / rows;
+    let remainder = n % rows;
+    (0..rows)
+        .flat_map(|i| {
+            // floor(i * n / rows), without overflowing i * n.
+            let row = i * quotient + i * remainder / rows;
+            data[row * d..(row + 1) * d].iter().copied()
+        })
+        .collect()
+}
+
 fn compute_residuals(
     data: &[f32],
     n: usize,
@@ -2974,6 +3106,236 @@ mod tests {
             }
         }
         data
+    }
+
+    /// Rows on a low-dimensional manifold with a little full-dimensional
+    /// noise: the shape real embeddings have and the projection is built for.
+    fn generate_low_rank_data(n: usize, d: usize, rank: usize, noise: f32, seed: u64) -> Vec<f32> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let factors: Vec<f32> = (0..rank * d).map(|_| rng.gen::<f32>() - 0.5).collect();
+        let mut data = vec![0.0f32; n * d];
+        for row in data.chunks_mut(d) {
+            let z: Vec<f32> = (0..rank).map(|_| rng.gen::<f32>() - 0.5).collect();
+            for (j, v) in row.iter_mut().enumerate() {
+                let mut acc = 0.0;
+                for t in 0..rank {
+                    acc += z[t] * factors[t * d + j];
+                }
+                *v = acc + (rng.gen::<f32>() - 0.5) * noise;
+            }
+        }
+        data
+    }
+
+    fn bucket_of(index: &IVFPQIndex, n: usize) -> Vec<usize> {
+        let mut bucket_of = vec![usize::MAX; n];
+        for (list_id, ids_in_list) in index.ids.iter().enumerate() {
+            for &id in ids_in_list {
+                bucket_of[id as usize] = list_id;
+            }
+        }
+        bucket_of
+    }
+
+    /// Buckets must equal the exact scan, except where two centroids are an
+    /// f32 near-tie and either answer is the exact nearest up to rounding.
+    fn assert_buckets_match_exact(index: &IVFPQIndex, data: &[f32], n: usize) {
+        let d = index.d;
+        let buckets = bucket_of(index, n);
+        let exact = kmeans::find_nearest_batch(data, n, &index.quantizer_centroids, index.nlist, d);
+        for i in 0..n {
+            assert_ne!(buckets[i], usize::MAX, "row {i} missing from lists");
+            if buckets[i] == exact[i] {
+                continue;
+            }
+            let q = &data[i * d..(i + 1) * d];
+            let chosen = crate::distance::fvec_l2sqr(
+                q,
+                &index.quantizer_centroids[buckets[i] * d..(buckets[i] + 1) * d],
+            );
+            let best = crate::distance::fvec_l2sqr(
+                q,
+                &index.quantizer_centroids[exact[i] * d..(exact[i] + 1) * d],
+            );
+            // The scan expands |x|² + |c|² - 2x·c in f32, so on offset data
+            // its own error is proportional to the norms, not the distance.
+            let norms = crate::distance::fvec_norm_l2sqr(q)
+                + crate::distance::fvec_norm_l2sqr(
+                    &index.quantizer_centroids[exact[i] * d..(exact[i] + 1) * d],
+                );
+            assert!(
+                (chosen - best).abs() <= 1e-5 * best.max(1e-12) + 1e-6 * norms,
+                "row {i}: bucket {} at {chosen} vs exact {} at {best}",
+                buckets[i],
+                exact[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_calibration_sample_spans_non_multiple_input() {
+        for n in [2049, 4095] {
+            let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            let sample = calibration_sample(&data, n, 1);
+            assert_eq!(sample.len(), crate::projected_assign::CALIBRATION_ROWS);
+            for (i, value) in sample.into_iter().enumerate() {
+                assert_eq!(
+                    value,
+                    (i * n / crate::projected_assign::CALIBRATION_ROWS) as f32
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_projected_assignment_matches_exact_scan() {
+        let d = 64;
+        let nlist = 256;
+        let n = 6000;
+        let data = generate_low_rank_data(n, d, 8, 0.2, 23);
+        let ids: Vec<i64> = (0..n as i64).collect();
+        for metric in [MetricType::L2, MetricType::InnerProduct, MetricType::Cosine] {
+            let mut index = IVFPQIndex::new(d, nlist, 8, metric, false)
+                .with_projected_assignment(ProjectedAssignment::Enabled);
+            index.train(&data, n);
+            assert!(index.coarse_projection().is_some());
+            index.add(&data, &ids, n);
+            let processed = index.preprocess_queries(&data, n);
+            assert_buckets_match_exact(&index, &processed, n);
+        }
+    }
+
+    #[test]
+    fn test_projected_assignment_with_opq_matches_exact_scan() {
+        let d = 32;
+        let nlist = 128;
+        let n = 4000;
+        let data = generate_low_rank_data(n, d, 6, 0.2, 24);
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let mut index = IVFPQIndex::new(d, nlist, 8, MetricType::L2, true)
+            .with_projected_assignment(ProjectedAssignment::Enabled);
+        index.train(&data, n);
+        index.add(&data, &ids, n);
+        let processed = index.preprocess_queries(&data, n);
+        assert_buckets_match_exact(&index, &processed, n);
+    }
+
+    /// The projection is fixed at train time, so the index bytes cannot
+    /// depend on how the caller batches `add`.
+    #[test]
+    fn test_projected_assignment_is_batch_invariant() {
+        let d = 64;
+        let nlist = 256;
+        let n = 6000;
+        let data = generate_low_rank_data(n, d, 8, 0.2, 25);
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let mut trained = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false)
+            .with_projected_assignment(ProjectedAssignment::Enabled);
+        trained.train(&data, n);
+
+        let mut whole = IVFPQIndex::from_trained(&trained);
+        whole.add(&data, &ids, n);
+        let mut split = IVFPQIndex::from_trained(&trained);
+        let mut offset = 0;
+        for chunk in [1usize, 999, 2000, 3000] {
+            split.add(
+                &data[offset * d..(offset + chunk) * d],
+                &ids[offset..offset + chunk],
+                chunk,
+            );
+            offset += chunk;
+        }
+        assert_eq!(offset, n);
+        assert_eq!(whole.ids, split.ids);
+        assert_eq!(whole.codes, split.codes);
+    }
+
+    #[test]
+    fn test_from_trained_shares_projection_and_retrain_rebuilds_it() {
+        let d = 64;
+        let nlist = 256;
+        let n = 6000;
+        let data = generate_low_rank_data(n, d, 8, 0.05, 26);
+        let mut trained = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false)
+            .with_projected_assignment(ProjectedAssignment::Enabled);
+        trained.train(&data, n);
+        let projection = trained.coarse_projection.clone().expect("projection");
+
+        let worker = IVFPQIndex::from_trained(&trained);
+        assert!(Arc::ptr_eq(
+            &projection,
+            worker.coarse_projection.as_ref().unwrap()
+        ));
+
+        trained.train(&data, n);
+        let rebuilt = trained
+            .coarse_projection
+            .clone()
+            .expect("projection after retrain");
+        assert!(!Arc::ptr_eq(&projection, &rebuilt));
+
+        trained.set_projected_assignment(ProjectedAssignment::Disabled);
+        assert!(trained.coarse_projection().is_none());
+        trained.set_projected_assignment(ProjectedAssignment::Enabled);
+        assert!(trained.coarse_projection().is_some());
+        trained.set_projected_assignment(ProjectedAssignment::Disabled);
+        let ids: Vec<i64> = (0..n as i64).collect();
+        trained.add(&data, &ids, n);
+        assert_buckets_match_exact(&trained, &data, n);
+    }
+
+    /// Replacing centroids after training must not leave `add` pruning with
+    /// bounds cached from the old centroids.
+    #[test]
+    fn test_replacing_centroids_after_train_rebuilds_projection() {
+        let d = 64;
+        let nlist = 512;
+        let n = 6000;
+        let data = generate_low_rank_data(n, d, 8, 0.05, 61);
+        let mut index = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false)
+            .with_projected_assignment(ProjectedAssignment::Enabled);
+        index.train(&data, n);
+        assert!(index.coarse_projection().is_some());
+
+        let mut centroids = index.quantizer_centroids().to_vec();
+        let moved: Vec<f32> = centroids[..d].iter().map(|v| v + 0.1).collect();
+        centroids[500 * d..501 * d].copy_from_slice(&moved);
+        index.set_quantizer_centroids(centroids);
+
+        index.add(&moved, &[7], 1);
+        assert_eq!(
+            index.ids[500],
+            vec![7],
+            "vector must land in the replaced list"
+        );
+        assert!(index.ids[0].is_empty());
+    }
+
+    #[test]
+    fn test_manual_centroid_load_in_auto_mode_skips_projection_without_calibration() {
+        let d = 64;
+        let nlist = 512;
+        let centroids = generate_low_rank_data(nlist, d, 8, 0.05, 62);
+        let mut index = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false);
+
+        index.set_quantizer_centroids(centroids);
+
+        assert!(index.coarse_projection().is_none());
+        // Empty centroids prove Auto returns before reading or projecting them.
+        assert!(CoarseProjection::train(&[], nlist, d, false, &[], 0).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot replace quantizer centroids after vectors have been added")]
+    fn test_replacing_centroids_after_add_is_rejected() {
+        let d = 8;
+        let n = 32;
+        let data: Vec<f32> = (0..n * d).map(|i| (i % 17) as f32 * 0.01).collect();
+        let mut index = IVFPQIndex::with_nbits(d, 1, 2, 4, MetricType::L2, false);
+        index.train(&data, n);
+        index.add(&data[..d], &[7], 1);
+
+        index.set_quantizer_centroids(index.quantizer_centroids().to_vec());
     }
 
     fn observed_ephemeral_precomputed_lists(
@@ -3496,6 +3858,8 @@ mod tests {
 
         let cosine = IVFPQIndex::new(2, 1, 1, MetricType::Cosine, false);
         assert!(matches!(cosine.preprocess_queries(&data, 2), Cow::Owned(_)));
+        assert!(!should_parallelize_preprocessing(85, 768));
+        assert!(should_parallelize_preprocessing(86, 768));
     }
 
     #[test]
@@ -5218,5 +5582,76 @@ mod tests {
     #[should_panic(expected = "4-bit IVF-PQ requires even m")]
     fn ivfpq_rejects_odd_4bit_subquantizer_count_at_construction() {
         let _ = IVFPQIndex::with_nbits(12, 4, 3, 4, MetricType::L2, false);
+    }
+
+    /// Regression for review r3869883629: build (both modes) and query must
+    /// agree on the nearest list even when the data is translated to 1e8.
+    #[test]
+    fn test_translated_vectors_share_one_coarse_contract() {
+        let d = 64;
+        let nlist = 64;
+        let n = 4000;
+        let mut data = generate_low_rank_data(n, d, 8, 0.2, 77);
+        for v in data.iter_mut() {
+            *v = *v * 4.0 + 1.0e8;
+        }
+        let ids: Vec<i64> = (0..n as i64).collect();
+        let mut disabled = IVFPQIndex::new(d, nlist, 8, MetricType::L2, false)
+            .with_projected_assignment(ProjectedAssignment::Disabled);
+        disabled.train(&data, n);
+        let mut enabled = IVFPQIndex::from_trained(&disabled);
+        enabled.set_projected_assignment(ProjectedAssignment::Enabled);
+        assert!(enabled.coarse_projection().is_some(), "projection declined");
+        disabled.add(&data, &ids, n);
+        enabled.add(&data, &ids, n);
+        let bd = bucket_of(&disabled, n);
+        let be = bucket_of(&enabled, n);
+        let mismatch = (0..n).filter(|&i| bd[i] != be[i]).count();
+        // true nearest by f64
+        let mut true_best = vec![0usize; n];
+        for i in 0..n {
+            let mut best = f64::INFINITY;
+            for c in 0..nlist {
+                let dist: f64 = (0..d)
+                    .map(|j| {
+                        let t =
+                            data[i * d + j] as f64 - disabled.quantizer_centroids[c * d + j] as f64;
+                        t * t
+                    })
+                    .sum();
+                if dist < best {
+                    best = dist;
+                    true_best[i] = c;
+                }
+            }
+        }
+        let wrong_d = (0..n).filter(|&i| bd[i] != true_best[i]).count();
+        let wrong_e = (0..n).filter(|&i| be[i] != true_best[i]).count();
+        // self-query, nprobe=1, single and batch
+        let mut miss = [0usize; 4];
+        for (ix, index) in [&disabled, &enabled].iter().enumerate() {
+            for i in 0..n {
+                let mut dists = vec![0.0f32; 1];
+                let mut labels = vec![-1i64; 1];
+                index.search(&data[i * d..(i + 1) * d], 1, 1, 1, &mut dists, &mut labels);
+                if labels[0] == -1 {
+                    miss[ix * 2] += 1;
+                }
+            }
+            let mut dists = vec![0.0f32; n];
+            let mut labels = vec![-1i64; n];
+            index.search(&data, n, 1, 1, &mut dists, &mut labels);
+            miss[ix * 2 + 1] = (0..n).filter(|&i| labels[i] == -1).count();
+        }
+        assert_eq!(mismatch, 0, "Enabled and Disabled assign different lists");
+        assert_eq!(
+            (wrong_d, wrong_e),
+            (0, 0),
+            "assignment differs from the f64 nearest centroid"
+        );
+        assert_eq!(
+            miss, [0; 4],
+            "self queries with nprobe=1 returned empty results"
+        );
     }
 }

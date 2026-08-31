@@ -135,7 +135,7 @@ impl RQRotation {
                     *value = -*value;
                 }
             }
-            for block in values.chunks_exact_mut(RQ_ROTATION_BLOCK_SIZE) {
+            for block in values.as_chunks_mut::<RQ_ROTATION_BLOCK_SIZE>().0 {
                 hadamard_64(block);
             }
             for (source, &destination) in permutation.iter().enumerate() {

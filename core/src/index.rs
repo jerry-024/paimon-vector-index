@@ -50,6 +50,7 @@ use crate::ivfsq_io::{
     search_batch_ivfsq_reader_filter_range, search_batch_ivfsq_reader_roaring_filter_range,
     write_ivfsq_index, IVFSQIndexReader, IVF_SQ_MAGIC,
 };
+use crate::projected_assign::ProjectedAssignment;
 pub use crate::read_options::{DeploymentProfile, VectorIndexReadPlan, VectorIndexReaderOptions};
 use crate::rq::{is_supported_rq_bits, padded_dimension, DEFAULT_RQ_BITS};
 use rand::rngs::StdRng;
@@ -1158,6 +1159,32 @@ pub struct VectorIndexTrainer {
 }
 
 impl VectorIndexTrainer {
+    pub fn from_options(options: &HashMap<String, String>) -> io::Result<Self> {
+        let mut config_options = ConfigOptions::new(options)?;
+        let projected_assignment = config_options
+            .optional("projected-assignment")
+            .map(|value| parse_bool_option("projected-assignment", &value))
+            .transpose()?;
+        config_options.values.remove("projected-assignment");
+        let config = VectorIndexConfig::from_options(&config_options.values)?;
+        if projected_assignment.is_some() && config.index_type() != IndexType::IvfPq {
+            return Err(invalid_input(
+                "projected-assignment is only valid for IVF-PQ",
+            ));
+        }
+        let mut trainer = Self::new(config)?;
+        if let (Some(enabled), VectorIndexWriter::IvfPq(index)) =
+            (projected_assignment, &mut trainer.writer)
+        {
+            index.set_projected_assignment(if enabled {
+                ProjectedAssignment::Enabled
+            } else {
+                ProjectedAssignment::Disabled
+            });
+        }
+        Ok(trainer)
+    }
+
     pub fn new(config: VectorIndexConfig) -> io::Result<Self> {
         let training_sample_limit = match &config {
             VectorIndexConfig::DiskAnn {
@@ -4138,6 +4165,68 @@ mod tests {
             }
             _ => panic!("expected IVF-SQ config"),
         }
+    }
+
+    #[test]
+    fn ivf_pq_projected_assignment_option() {
+        let auto = VectorIndexTrainer::from_options(&options(&[
+            ("index.type", "ivf_pq"),
+            ("dimension", "768"),
+            ("nlist", "4096"),
+            ("metric", "cosine"),
+        ]))
+        .unwrap();
+        let VectorIndexWriter::IvfPq(auto) = auto.writer else {
+            panic!("expected IVF-PQ writer");
+        };
+        assert_eq!(auto.projected_assignment, ProjectedAssignment::Auto);
+
+        for (value, expected) in [
+            ("true", ProjectedAssignment::Enabled),
+            ("false", ProjectedAssignment::Disabled),
+        ] {
+            let trainer = VectorIndexTrainer::from_options(&options(&[
+                ("index.type", "ivf_pq"),
+                ("dimension", "768"),
+                ("nlist", "4096"),
+                ("metric", "cosine"),
+                ("projected-assignment", value),
+            ]))
+            .unwrap();
+            let VectorIndexWriter::IvfPq(index) = trainer.writer else {
+                panic!("expected IVF-PQ writer");
+            };
+            assert_eq!(index.projected_assignment, expected);
+        }
+    }
+
+    #[test]
+    fn config_from_options_rejects_projected_assignment() {
+        let values = options(&[
+            ("index.type", "ivf_pq"),
+            ("dimension", "768"),
+            ("nlist", "4096"),
+            ("metric", "cosine"),
+            ("projected-assignment", "false"),
+        ]);
+        let error = VectorIndexConfig::from_options(&values).unwrap_err();
+        assert!(error.to_string().contains("unknown vector index option"));
+    }
+
+    #[test]
+    fn trainer_rejects_projected_assignment_for_non_ivf_pq() {
+        let error = VectorIndexTrainer::from_options(&options(&[
+            ("index.type", "ivf_flat"),
+            ("dimension", "8"),
+            ("nlist", "4"),
+            ("metric", "l2"),
+            ("projected-assignment", "true"),
+        ]))
+        .err()
+        .expect("IVF-Flat must reject projected assignment");
+        assert!(error
+            .to_string()
+            .contains("projected-assignment is only valid for IVF-PQ"));
     }
 
     #[test]

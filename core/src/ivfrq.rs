@@ -478,7 +478,10 @@ mod tests {
         serial.train(&data, n);
 
         parallel.add(&data, &ids, n);
-        for (data_chunk, id_chunk) in data.chunks_exact(512 * d).zip(ids.chunks_exact(512)) {
+        for (data_chunk, id_chunk) in data
+            .chunks_exact(512 * d)
+            .zip(ids.as_chunks::<512>().0.iter())
+        {
             serial.add(data_chunk, id_chunk, 512);
         }
 

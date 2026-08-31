@@ -399,7 +399,12 @@ impl<R: SeekRead> IVFRQIndexReader<R> {
         self.list_offsets = vec![0; self.nlist];
         self.list_counts = vec![0; self.nlist];
         self.list_id_bytes_lens = vec![0; self.nlist];
-        for (list_id, entry) in metadata[centroid_bytes..].chunks_exact(16).enumerate() {
+        for (list_id, entry) in metadata[centroid_bytes..]
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .enumerate()
+        {
             self.list_offsets[list_id] = i64::from_le_bytes(entry[0..8].try_into().unwrap());
             self.list_counts[list_id] = validate_non_negative_i32(
                 i32::from_le_bytes(entry[8..12].try_into().unwrap()),
@@ -1251,8 +1256,10 @@ fn bytes_to_f32_vec(bytes: &[u8]) -> io::Result<Vec<f32>> {
         return Err(invalid_data("IVF-RQ f32 section is not aligned"));
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect())
 }
 

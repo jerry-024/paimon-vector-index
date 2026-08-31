@@ -308,7 +308,7 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
         let mut list_counts = vec![0; nlist];
         let mut list_id_bytes_lens = vec![0; nlist];
         let mut actual_total = 0i64;
-        for (list_id, entry) in offset_table.chunks_exact(16).enumerate() {
+        for (list_id, entry) in offset_table.as_chunks::<16>().0.iter().enumerate() {
             list_offsets[list_id] = i64::from_le_bytes(entry[0..8].try_into().unwrap());
             let count = i32::from_le_bytes(entry[8..12].try_into().unwrap());
             let id_bytes_len = i32::from_le_bytes(entry[12..16].try_into().unwrap());

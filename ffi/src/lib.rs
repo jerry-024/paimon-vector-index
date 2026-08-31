@@ -19,10 +19,9 @@
 
 use paimon_vindex_core::distance::MetricType;
 use paimon_vindex_core::index::{
-    IvfPqBatchTableReuseMode, SearchWidth, VectorIndexConfig, VectorIndexMetadata,
-    VectorIndexReadPlan, VectorIndexReader, VectorIndexReaderOptions, VectorIndexTrainer,
-    VectorIndexTraining, VectorIndexWriter, VectorSearchParams,
-    DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
+    IvfPqBatchTableReuseMode, SearchWidth, VectorIndexMetadata, VectorIndexReadPlan,
+    VectorIndexReader, VectorIndexReaderOptions, VectorIndexTrainer, VectorIndexTraining,
+    VectorIndexWriter, VectorSearchParams, DEFAULT_IVFPQ_BATCH_TABLE_REUSE_MAX_BYTES,
 };
 use paimon_vindex_core::io::{ReadRequest, SeekRead, SeekReadCapabilities, SeekWrite};
 use std::cell::RefCell;
@@ -719,10 +718,8 @@ pub unsafe extern "C" fn paimon_vindex_trainer_open(
 ) -> *mut PaimonVindexTrainerHandle {
     ffi_ptr(|| {
         let options = unsafe { options_from_raw(keys, values, num_options) }?;
-        let config = VectorIndexConfig::from_options(&options)
-            .map_err(|e| format!("invalid vector index options: {}", e))?;
-        let trainer =
-            VectorIndexTrainer::new(config).map_err(|e| format!("create trainer: {}", e))?;
+        let trainer = VectorIndexTrainer::from_options(&options)
+            .map_err(|e| format!("create trainer: {}", e))?;
         Ok(Box::into_raw(Box::new(PaimonVindexTrainerHandle {
             inner: Some(trainer),
         })))
