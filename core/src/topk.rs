@@ -86,6 +86,10 @@ impl TopKHeap {
         self.is_full().then(|| self.data[0].0)
     }
 
+    pub(crate) fn distance_limit(&self) -> f32 {
+        self.worst_distance().unwrap_or(self.max_distance)
+    }
+
     pub(crate) fn into_sorted(mut self) -> Vec<(f32, i64)> {
         self.data.sort_by(|a, b| a.0.total_cmp(&b.0));
         self.data

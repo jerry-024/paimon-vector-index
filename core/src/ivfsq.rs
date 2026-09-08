@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! IVF with per-list, per-dimension 8-bit residual scalar quantization.
+//! IVF with per-dimension 8-bit residual scalar quantization.
 
 use crate::coarse::CoarseAssignment;
-use crate::distance::{fvec_madd, preprocess_vectors, MetricType};
+use crate::distance::{preprocess_vectors, MetricType};
 use crate::ivfpq::RowIdFilter;
 use crate::kmeans::{self, KMeansConfig};
 use crate::sq::ScalarQuantizer;
@@ -86,9 +86,14 @@ impl IVFSQIndex {
         self.quantizer_centroids =
             kmeans::kmeans_train(&KMeansConfig::default(), &processed, n, self.d, self.nlist);
         self.coarse_assignment.reset();
-        let (list_ids, residuals) = self.assign_residuals(&processed, n);
-        self.sq.train(&residuals, n);
-        self.train_list_sqs(&list_ids, &residuals);
+        let list_ids = self.coarse_assignment.assign(
+            &processed,
+            n,
+            &self.quantizer_centroids,
+            self.nlist,
+            self.d,
+        );
+        self.train_list_sqs(&processed, &list_ids);
     }
 
     pub fn add(&mut self, data: &[f32], ids: &[i64], n: usize) {
@@ -247,44 +252,39 @@ impl IVFSQIndex {
         }
     }
 
-    fn assign_residuals(&mut self, processed: &[f32], n: usize) -> (Vec<usize>, Vec<f32>) {
-        let list_ids = self.coarse_assignment.assign(
-            processed,
-            n,
-            &self.quantizer_centroids,
-            self.nlist,
-            self.d,
-        );
-        let mut residuals = vec![0.0f32; n * self.d];
-        for i in 0..n {
-            let vector = &processed[i * self.d..(i + 1) * self.d];
-            self.write_residual(
-                vector,
-                list_ids[i],
-                &mut residuals[i * self.d..(i + 1) * self.d],
-            );
+    fn train_list_sqs(&mut self, data: &[f32], list_ids: &[usize]) {
+        if list_ids.is_empty() {
+            self.sq = ScalarQuantizer::new(self.d);
+            self.list_sqs = vec![self.sq.clone(); self.nlist];
+            return;
         }
-        (list_ids, residuals)
-    }
-
-    fn train_list_sqs(&mut self, list_ids: &[usize], residuals: &[f32]) {
-        let mut list_residuals = vec![Vec::new(); self.nlist];
-        for (i, &list_id) in list_ids.iter().enumerate() {
-            let residual = &residuals[i * self.d..(i + 1) * self.d];
-            list_residuals[list_id].extend_from_slice(residual);
+        let mut list_rows = vec![Vec::new(); self.nlist];
+        for (row, &list_id) in list_ids.iter().enumerate() {
+            list_rows[list_id].push(row);
         }
-        self.list_sqs = vec![self.sq.clone(); self.nlist];
-        for (list_id, values) in list_residuals.iter().enumerate() {
-            if !values.is_empty() {
-                let mut sq = ScalarQuantizer::new(self.d);
-                sq.train(values, values.len() / self.d);
-                self.list_sqs[list_id] = sq;
+        let trained = list_rows
+            .par_iter()
+            .enumerate()
+            .map(|(list_id, rows)| {
+                (!rows.is_empty()).then(|| {
+                    ScalarQuantizer::train_residual_rows(data, rows, self.list_centroid(list_id))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut mins = vec![f32::INFINITY; self.d];
+        let mut maxs = vec![f32::NEG_INFINITY; self.d];
+        for sq in trained.iter().flatten() {
+            for dim in 0..self.d {
+                mins[dim] = mins[dim].min(sq.mins[dim]);
+                maxs[dim] = maxs[dim].max(sq.maxs[dim]);
             }
         }
-    }
-
-    fn write_residual(&self, vector: &[f32], list_id: usize, out: &mut [f32]) {
-        fvec_madd(vector, self.list_centroid(list_id), -1.0, out);
+        self.sq = ScalarQuantizer::with_dimension_bounds(self.d, mins, maxs);
+        // A training sample may contain only a handful of rows in a partition.
+        // Its extrema severely clip unseen residuals (including constant sample
+        // dimensions). Pool the observed residual bounds across partitions;
+        // retain per-list metadata so existing v1 files keep their own bounds.
+        self.list_sqs = vec![self.sq.clone(); self.nlist];
     }
 
     pub(crate) fn list_centroid(&self, list_id: usize) -> &[f32] {
@@ -312,22 +312,45 @@ fn append_encoded_rows(
     output_codes: &mut Vec<u8>,
 ) {
     output_ids.reserve(rows.len());
-    output_codes.reserve(rows.len().saturating_mul(d));
-    let mut residual = vec![0.0f32; d];
-    let mut code = vec![0u8; d];
-    for &row in rows {
-        let vector = &data[row * d..(row + 1) * d];
-        fvec_madd(vector, centroid, -1.0, &mut residual);
-        sq.encode(&residual, &mut code);
-        output_ids.push(input_ids[row]);
-        output_codes.extend_from_slice(&code);
+    if rows.is_empty() {
+        return;
     }
+    let start = output_codes.len();
+    output_codes.resize(start + rows.len() * d, 0);
+    sq.encode_residual_rows(data, rows, centroid, &mut output_codes[start..]);
+    output_ids.extend(rows.iter().map(|&row| input_ids[row]));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::distance::fvec_madd;
     use std::collections::HashSet;
+
+    #[test]
+    fn sparse_partition_bounds_do_not_collapse_unseen_residuals() {
+        let mut index = IVFSQIndex::new(2, 3, MetricType::L2);
+        index.set_quantizer_centroids(vec![0.0, 0.0, 10.0, 10.0, 20.0, 20.0]);
+        index.train_list_sqs(&[-2.0, -2.0, 10.0, 10.0, 12.0, 12.0], &[0, 1, 1]);
+        // Partition zero saw only one residual and partition two was empty.
+        // Neither should freeze future vectors at a sample's constant value.
+        index.add(&[0.0, 0.0, 20.0, 20.0], &[42, 43], 2);
+        let mut distances = [0.0; 2];
+        let mut labels = [0; 2];
+        index.search(
+            &[0.0, 0.0, 20.0, 20.0],
+            2,
+            1,
+            3,
+            &mut distances,
+            &mut labels,
+        );
+        assert_eq!(labels, [42, 43]);
+        assert!(
+            distances.iter().all(|&distance| distance < 0.001),
+            "{distances:?}"
+        );
+    }
 
     #[test]
     fn ivfsq_full_scan_recalls_added_vector() {

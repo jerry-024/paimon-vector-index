@@ -30,11 +30,14 @@ use crate::io::{ReadRequest, SeekRead, SeekWrite};
 use crate::ivfpq::RowIdFilter;
 use crate::ivfsq::IVFSQIndex;
 use crate::kmeans;
+use crate::read_options::VectorIndexReaderOptions;
 use crate::sq::ScalarQuantizer;
 use crate::topk::TopKHeap;
 use rayon::prelude::*;
+use std::collections::VecDeque;
 use std::io;
 use std::mem::size_of;
+use std::sync::Arc;
 
 pub const IVF_SQ_MAGIC: u32 = 0x49565351; // "IVSQ"
 pub const IVF_SQ_VERSION: u32 = 1;
@@ -58,6 +61,7 @@ pub fn write_ivfsq_index(index: &IVFSQIndex, out: &mut dyn SeekWrite) -> io::Res
         })
     })?;
     let sorted_lists = (0..index.nlist)
+        .into_par_iter()
         .map(|list_id| build_sorted_sq_list_metadata(index, list_id))
         .collect::<io::Result<Vec<_>>>()?;
 
@@ -121,20 +125,42 @@ pub fn write_ivfsq_index(index: &IVFSQIndex, out: &mut dyn SeekWrite) -> io::Res
         write_i32_le(out, list_counts[list_id])?;
         write_i32_le(out, list_id_bytes_lens[list_id])?;
     }
-    for (list_id, list) in sorted_lists.iter().enumerate() {
-        if list.order.is_empty() {
-            continue;
+    // Bound transposition scratch independently of the total index size. An
+    // oversized individual list still uses at most one list's code buffer.
+    const TRANSPOSE_BATCH_BYTES: usize = 16 * 1024 * 1024;
+    let mut start = 0;
+    while start < index.nlist {
+        let mut end = start;
+        let mut bytes = 0;
+        while end < index.nlist {
+            let next = index.codes[end].len();
+            if end > start && next > TRANSPOSE_BATCH_BYTES.saturating_sub(bytes) {
+                break;
+            }
+            bytes += next;
+            end += 1;
         }
-        let codes = block_sorted_sq_codes(
-            &index.codes[list_id],
-            &list.order,
-            index.d,
-            IVF_SQ_SCAN_BLOCK_SIZE,
-        );
-        out.write_all(&codes)?;
-        write_i64_le(out, list.base_id)?;
-        write_i32_le(out, usize_to_i32(list.id_bytes.len(), "delta ID section")?)?;
-        out.write_all(&list.id_bytes)?;
+        let blocked = (start..end)
+            .into_par_iter()
+            .map(|list_id| {
+                block_sorted_sq_codes(
+                    &index.codes[list_id],
+                    &sorted_lists[list_id].order,
+                    index.d,
+                    IVF_SQ_SCAN_BLOCK_SIZE,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (list, codes) in sorted_lists[start..end].iter().zip(blocked) {
+            if list.order.is_empty() {
+                continue;
+            }
+            out.write_all(&codes)?;
+            write_i64_le(out, list.base_id)?;
+            write_i32_le(out, usize_to_i32(list.id_bytes.len(), "delta ID section")?)?;
+            out.write_all(&list.id_bytes)?;
+        }
+        start = end;
     }
     Ok(())
 }
@@ -152,18 +178,26 @@ pub struct IVFSQIndexReader<R: SeekRead> {
     pub list_counts: Vec<i32>,
     pub list_id_bytes_lens: Vec<i32>,
     loaded: bool,
+    list_cache: Option<SqListCache>,
 }
 
 impl<R: SeekRead> IVFSQIndexReader<R> {
-    pub fn open(mut reader: R) -> io::Result<Self> {
-        let mut header = [0u8; IVF_SQ_HEADER_SIZE];
-        reader.pread(&mut [ReadRequest::new(0, &mut header)])?;
-        Self::open_with_header(reader, header)
+    pub fn open(reader: R) -> io::Result<Self> {
+        Self::open_with_options(reader, VectorIndexReaderOptions::new(0))
     }
 
-    pub(crate) fn open_with_header(
+    /// Open with a bounded cache of decoded partitions. `open` retains the
+    /// uncached positional-I/O behavior for callers that manage their own cache.
+    pub fn open_with_options(mut reader: R, options: VectorIndexReaderOptions) -> io::Result<Self> {
+        let mut header = [0u8; IVF_SQ_HEADER_SIZE];
+        reader.pread(&mut [ReadRequest::new(0, &mut header)])?;
+        Self::open_with_header_and_options(reader, header, options)
+    }
+
+    pub(crate) fn open_with_header_and_options(
         mut reader: R,
         header: [u8; IVF_SQ_HEADER_SIZE],
+        options: VectorIndexReaderOptions,
     ) -> io::Result<Self> {
         let read_u32 =
             |offset: usize| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
@@ -339,6 +373,19 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             ));
         }
 
+        let resident = size_of::<Self>()
+            + quantizer_centroids.capacity() * size_of::<f32>()
+            + list_offsets.capacity() * size_of::<i64>()
+            + list_counts.capacity() * size_of::<i32>()
+            + list_id_bytes_lens.capacity() * size_of::<i32>()
+            + list_sqs.capacity() * size_of::<ScalarQuantizer>()
+            + std::iter::once(&sq)
+                .chain(&list_sqs)
+                .map(|sq| (sq.mins.capacity() + sq.maxs.capacity()) * size_of::<f32>())
+                .sum::<usize>();
+        let list_cache =
+            SqListCache::new(nlist, options.memory_budget_bytes.saturating_sub(resident));
+
         Ok(Self {
             reader,
             d,
@@ -352,6 +399,7 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             list_counts,
             list_id_bytes_lens,
             loaded: true,
+            list_cache,
         })
     }
 
@@ -427,6 +475,56 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
                 })
             })
             .collect()
+    }
+
+    fn read_scan_lists(&mut self, list_ids: &[usize]) -> io::Result<Vec<Arc<SqListData>>> {
+        if self.list_cache.is_none() {
+            return self
+                .read_inverted_lists(list_ids)
+                .map(|lists| lists.into_iter().map(Arc::new).collect());
+        }
+        let mut results = vec![None; list_ids.len()];
+        let mut misses = Vec::new();
+        for (position, &list_id) in list_ids.iter().enumerate() {
+            if list_id >= self.nlist {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "IVF-SQ list ID out of range",
+                ));
+            }
+            let cache = self.list_cache.as_mut().unwrap();
+            if let Some(entry) = &cache.entries[list_id] {
+                if entry.offset == self.list_offsets[list_id]
+                    && entry.count == self.list_counts[list_id]
+                    && entry.id_bytes_len == self.list_id_bytes_lens[list_id]
+                    && entry.d == self.d
+                {
+                    results[position] = Some(Arc::clone(&entry.list));
+                    continue;
+                }
+                // Public reader metadata may have been edited by a low-level
+                // caller. Never serve a payload for a different range or shape.
+                cache.remove(list_id);
+                cache.order.retain(|&id| id != list_id);
+            }
+            misses.push((position, list_id));
+        }
+        if !misses.is_empty() {
+            let missing_ids = misses.iter().map(|&(_, id)| id).collect::<Vec<_>>();
+            let loaded = self.read_inverted_lists(&missing_ids)?;
+            for ((position, list_id), list) in misses.into_iter().zip(loaded) {
+                let list = Arc::new(list);
+                self.list_cache.as_mut().unwrap().insert(CachedSqList {
+                    offset: self.list_offsets[list_id],
+                    count: self.list_counts[list_id],
+                    id_bytes_len: self.list_id_bytes_lens[list_id],
+                    d: self.d,
+                    list: Arc::clone(&list),
+                });
+                results[position] = Some(list);
+            }
+        }
+        Ok(results.into_iter().map(Option::unwrap).collect())
     }
 
     fn batch_read_end(&self, list_ids: &[usize]) -> io::Result<usize> {
@@ -563,16 +661,28 @@ impl<R: SeekRead> IVFSQIndexReader<R> {
             }
             let count = self.batch_read_end(&probe_indices[batch_start..])?.max(1);
             let batch_end = (batch_start + count).min(probe_indices.len());
-            let lists = self.read_inverted_lists(&probe_indices[batch_start..batch_end])?;
+            let lists = self.read_scan_lists(&probe_indices[batch_start..batch_end])?;
             let centroids = &self.quantizer_centroids;
             let list_sqs = &self.list_sqs;
             let global_sq = &self.sq;
             let candidate_count = lists.iter().map(|list| list.ids.len()).sum::<usize>();
             if candidate_count >= PARALLEL_SQ_SCAN_MIN_CANDIDATES {
-                let per_list_results = lists
+                let first = &lists[0];
+                scan_sq_list(
+                    &query,
+                    first,
+                    &centroids[first.list_id * d..(first.list_id + 1) * d],
+                    list_sqs.get(first.list_id).unwrap_or(global_sq),
+                    metric,
+                    filter,
+                    &mut SqScanScratch::default(),
+                    &mut heap,
+                );
+                let cutoff = heap.distance_limit();
+                let per_list_results = lists[1..]
                     .par_iter()
                     .map_init(SqScanScratch::default, |scratch, list| {
-                        let mut local_heap = TopKHeap::new(k);
+                        let mut local_heap = TopKHeap::with_max_distance(k, cutoff);
                         let list_id = list.list_id;
                         scan_sq_list(
                             &query,
@@ -666,6 +776,9 @@ pub(crate) fn search_batch_ivfsq_reader_filter_range<R: SeekRead>(
         ));
     }
     validate_batch_seed(seed_ids, seed_distances, nq, k)?;
+    if nq == 1 && probe_start == 0 && seed_ids.is_empty() {
+        return reader.search_with_filter(queries, k, probe_end, filter);
+    }
     let processed = preprocess_vectors(queries, nq, reader.d, reader.metric);
     let (all_probe_indices, _) = kmeans::find_topk_batch(
         &processed,
@@ -731,41 +844,36 @@ pub(crate) fn search_batch_ivfsq_reader_filter_range<R: SeekRead>(
         }
         let count = reader.batch_read_end(&unique_lists[batch_start..])?.max(1);
         let batch_end = (batch_start + count).min(unique_lists.len());
-        let loaded_lists = reader.read_inverted_lists(&unique_lists[batch_start..batch_end])?;
+        let loaded_lists = reader.read_scan_lists(&unique_lists[batch_start..batch_end])?;
         let centroids = &reader.quantizer_centroids;
         let list_sqs = &reader.list_sqs;
         let global_sq = &reader.sq;
-        let per_list_results = loaded_lists
-            .par_iter()
-            .map_init(SqScanScratch::default, |scratch, list| {
-                let list_id = list.list_id;
-                list_to_queries[list_id]
-                    .iter()
-                    .map(|&query_index| {
-                        let query = &processed[query_index * d..(query_index + 1) * d];
-                        let mut heap = TopKHeap::new(k);
+        let mut list_positions = vec![None; reader.nlist];
+        for (position, list) in loaded_lists.iter().enumerate() {
+            list_positions[list.list_id] = Some(position);
+        }
+        // Keep a query's heap across partitions. Besides avoiding nprobe
+        // allocations and merges, this carries the current cutoff into later scans.
+        heaps.par_iter_mut().enumerate().for_each_init(
+            SqScanScratch::default,
+            |scratch, (query_index, heap)| {
+                let query = &processed[query_index * d..(query_index + 1) * d];
+                for &list_id in all_probe_indices[query_index].iter().skip(probe_start) {
+                    if let Some(position) = list_positions[list_id] {
                         scan_sq_list(
                             query,
-                            list,
+                            &loaded_lists[position],
                             &centroids[list_id * d..(list_id + 1) * d],
                             list_sqs.get(list_id).unwrap_or(global_sq),
                             metric,
                             filter,
                             scratch,
-                            &mut heap,
+                            heap,
                         );
-                        (query_index, heap.into_sorted())
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        for list_results in per_list_results {
-            for (query_index, results) in list_results {
-                for (distance, row_id) in results {
-                    heaps[query_index].push(distance, row_id);
+                    }
                 }
-            }
-        }
+            },
+        );
         batch_start = batch_end;
     }
 
@@ -868,6 +976,75 @@ pub struct SqListData {
     pub codes: Vec<u8>,
 }
 
+struct CachedSqList {
+    offset: i64,
+    count: i32,
+    id_bytes_len: i32,
+    d: usize,
+    list: Arc<SqListData>,
+}
+
+impl CachedSqList {
+    fn retained_bytes(&self) -> usize {
+        size_of::<SqListData>()
+            + 2 * size_of::<usize>()
+            + self.list.ids.capacity() * size_of::<i64>()
+            + self.list.codes.capacity()
+    }
+}
+
+/// FIFO eviction keeps cache bookkeeping O(1) without per-hit allocations.
+/// Both the slot table and queue are reserved and charged to the budget up front.
+struct SqListCache {
+    entries: Vec<Option<CachedSqList>>,
+    order: VecDeque<usize>,
+    capacity_bytes: usize,
+    retained_bytes: usize,
+}
+
+impl SqListCache {
+    fn new(nlist: usize, budget: usize) -> Option<Self> {
+        let fixed = nlist.checked_mul(size_of::<Option<CachedSqList>>() + size_of::<usize>())?;
+        if budget <= fixed {
+            return None;
+        }
+        let entries = (0..nlist).map(|_| None).collect::<Vec<_>>();
+        let order = VecDeque::<usize>::with_capacity(nlist);
+        let fixed = entries.capacity() * size_of::<Option<CachedSqList>>()
+            + order.capacity() * size_of::<usize>();
+        if budget <= fixed {
+            return None;
+        }
+        Some(Self {
+            entries,
+            order,
+            capacity_bytes: budget.saturating_sub(fixed),
+            retained_bytes: 0,
+        })
+    }
+
+    fn remove(&mut self, list_id: usize) {
+        if let Some(entry) = self.entries[list_id].take() {
+            self.retained_bytes -= entry.retained_bytes();
+        }
+    }
+
+    fn insert(&mut self, entry: CachedSqList) {
+        let bytes = entry.retained_bytes();
+        let list_id = entry.list.list_id;
+        if bytes > self.capacity_bytes || self.entries[list_id].is_some() {
+            return;
+        }
+        while bytes > self.capacity_bytes - self.retained_bytes {
+            let oldest = self.order.pop_front().expect("nonempty cache over budget");
+            self.remove(oldest);
+        }
+        self.retained_bytes += bytes;
+        self.order.push_back(list_id);
+        self.entries[list_id] = Some(entry);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BatchedListRead {
     input_index: usize,
@@ -929,6 +1106,7 @@ fn scan_sq_rows(
         centroid,
         metric,
         IVF_SQ_SCAN_BLOCK_SIZE,
+        heap.distance_limit(),
         &mut scratch.parameters,
         &mut scratch.distances,
     );
@@ -1083,13 +1261,16 @@ fn block_sorted_sq_codes(
     block_size: usize,
 ) -> Vec<u8> {
     debug_assert_eq!(row_major.len(), order.len() * d);
-    let mut blocked = Vec::with_capacity(row_major.len());
+    let mut blocked = vec![0; row_major.len()];
     for block_start in (0..order.len()).step_by(block_size) {
         let block_len = (order.len() - block_start).min(block_size);
-        for dimension in 0..d {
-            for lane in 0..block_len {
-                let source_row = order[block_start + lane];
-                blocked.push(row_major[source_row * d + dimension]);
+        let block = &mut blocked[block_start * d..(block_start + block_len) * d];
+        for (dimension, column) in block.chunks_exact_mut(block_len).enumerate() {
+            for (dst, &source_row) in column
+                .iter_mut()
+                .zip(&order[block_start..block_start + block_len])
+            {
+                *dst = row_major[source_row * d + dimension];
             }
         }
     }
@@ -1122,6 +1303,121 @@ mod tests {
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn ivfsq_partition_cache_reuses_payloads_and_keeps_filters_query_local() {
+        let (index, data, _) = build_index(37, 8, 4_097);
+        let bytes = serialized_index(&index);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingReader {
+            inner: Cursor::new(bytes.clone()),
+            calls: Arc::clone(&calls),
+        };
+        let mut cached = IVFSQIndexReader::open_with_options(
+            source,
+            VectorIndexReaderOptions::new(4 * 1024 * 1024),
+        )
+        .unwrap();
+        let mut uncached = IVFSQIndexReader::open(Cursor::new(bytes)).unwrap();
+        let query = &data[127 * 37..128 * 37];
+        let expected = uncached.search(query, 10, 8).unwrap();
+        assert_eq!(cached.search(query, 10, 8).unwrap(), expected);
+        calls.store(0, Ordering::Relaxed);
+        let first = cached.read_scan_lists(&[0, 1]).unwrap();
+        let again = cached.read_scan_lists(&[1, 0]).unwrap();
+        assert!(Arc::ptr_eq(&first[0], &again[1]));
+        assert!(Arc::ptr_eq(&first[1], &again[0]));
+        let filter = std::collections::HashSet::from([expected.0[3]]);
+        assert_eq!(
+            cached
+                .search_with_filter(query, 10, 8, Some(&filter))
+                .unwrap(),
+            uncached
+                .search_with_filter(query, 10, 8, Some(&filter))
+                .unwrap()
+        );
+        assert_eq!(cached.search(query, 10, 8).unwrap(), expected);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "warm scans must not reenter positional I/O"
+        );
+    }
+
+    #[test]
+    fn ivfsq_partition_cache_is_bounded_and_evicts_without_retaining_duplicate_keys() {
+        fn entry(list_id: usize, bytes: usize) -> CachedSqList {
+            CachedSqList {
+                offset: list_id as i64,
+                count: 1,
+                id_bytes_len: 1,
+                d: bytes,
+                list: Arc::new(SqListData {
+                    list_id,
+                    ids: vec![list_id as i64],
+                    codes: vec![0; bytes],
+                }),
+            }
+        }
+        let fixed = 4 * (size_of::<Option<CachedSqList>>() + size_of::<usize>());
+        let size = entry(0, 64).retained_bytes();
+        let mut cache = SqListCache::new(4, fixed + size * 2).unwrap();
+        cache.insert(entry(0, 64));
+        cache.insert(entry(1, 64));
+        cache.insert(entry(1, 64));
+        assert_eq!(cache.order.iter().copied().collect::<Vec<_>>(), [0, 1]);
+        cache.insert(entry(2, 64));
+        assert!(cache.entries[0].is_none());
+        assert!(cache.entries[1].is_some());
+        assert!(cache.entries[2].is_some());
+        assert_eq!(cache.retained_bytes, size * 2);
+        cache.insert(entry(3, size * 3));
+        assert!(
+            cache.entries[3].is_none(),
+            "an oversized partition must bypass the cache"
+        );
+        assert_eq!(cache.retained_bytes, size * 2);
+        assert!(SqListCache::new(4, 0).is_none());
+        assert!(SqListCache::new(4, fixed).is_none());
+    }
+
+    #[test]
+    fn ivfsq_cache_misses_retry_after_io_failure_and_zero_budget_stays_uncached() {
+        let (index, _, _) = build_index(5, 2, 65);
+        let bytes = serialized_index(&index);
+        let mut cached = IVFSQIndexReader::open_with_options(
+            Cursor::new(bytes.clone()),
+            VectorIndexReaderOptions::new(1024 * 1024),
+        )
+        .unwrap();
+        cached.read_scan_lists(&[0]).unwrap();
+        let offset = cached.list_offsets[1];
+        cached.list_offsets[1] = bytes.len() as i64 + 1;
+        assert!(cached.read_scan_lists(&[1]).is_err());
+        assert!(cached.list_cache.as_ref().unwrap().entries[1].is_none());
+        cached.list_offsets[1] = offset;
+        let expected = cached.read_scan_lists(&[1]).unwrap();
+        // Even a warmed entry must not hide an edited offset.
+        cached.list_offsets[1] = bytes.len() as i64 + 1;
+        assert!(cached.read_scan_lists(&[1]).is_err());
+        cached.list_offsets[1] = offset;
+        assert_eq!(
+            cached.read_scan_lists(&[1]).unwrap()[0].ids,
+            expected[0].ids
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = CountingReader {
+            inner: Cursor::new(bytes),
+            calls: Arc::clone(&calls),
+        };
+        let mut uncached =
+            IVFSQIndexReader::open_with_options(source, VectorIndexReaderOptions::new(0)).unwrap();
+        assert!(uncached.list_cache.is_none());
+        calls.store(0, Ordering::Relaxed);
+        uncached.read_scan_lists(&[0, 1]).unwrap();
+        uncached.read_scan_lists(&[0, 1]).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
 
     fn build_index(d: usize, nlist: usize, n: usize) -> (IVFSQIndex, Vec<f32>, Vec<i64>) {
         let data = (0..n)
@@ -1187,6 +1483,48 @@ mod tests {
         let second = single_reader.search(&queries[8..16], 5, 4).unwrap();
         assert_eq!(batch.0, [first.0, second.0].concat());
         assert_eq!(batch.1, [first.1, second.1].concat());
+    }
+
+    #[test]
+    fn ivfsq_single_query_batch_and_seeded_probe_ranges_match_full_search() {
+        let d = 37;
+        let nlist = 8;
+        let (index, data, _) = build_index(d, nlist, 8_193);
+        let bytes = serialized_index(&index);
+        let mut reader = IVFSQIndexReader::open(Cursor::new(bytes)).unwrap();
+        let query = &data[127 * d..128 * d];
+        let expected = reader.search(query, 10, nlist).unwrap();
+        let one = search_batch_ivfsq_reader(&mut reader, query, 1, 10, nlist).unwrap();
+        assert_eq!(one, expected);
+        let first =
+            search_batch_ivfsq_reader_filter_range(&mut reader, query, 1, 10, 0, 3, &[], &[], None)
+                .unwrap();
+        let refined = search_batch_ivfsq_reader_filter_range(
+            &mut reader,
+            query,
+            1,
+            10,
+            3,
+            nlist,
+            &first.0,
+            &first.1,
+            None,
+        )
+        .unwrap();
+        // Repeated vectors can tie; verify distances and the returned IDs' scores.
+        assert_eq!(refined.1, expected.1);
+        for (&id, &distance) in refined.0.iter().zip(&refined.1) {
+            let (ids, distances) = reader
+                .search_with_filter(
+                    query,
+                    1,
+                    nlist,
+                    Some(&std::collections::HashSet::from([id])),
+                )
+                .unwrap();
+            assert_eq!(ids, [id]);
+            assert_eq!(distances, [distance]);
+        }
     }
 
     #[test]
@@ -1292,20 +1630,64 @@ mod tests {
     }
 
     #[test]
-    fn ivfsq_open_coalesces_resident_metadata() {
-        let (index, _, _) = build_index(8, 32, 512);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let source = CountingReader {
-            inner: Cursor::new(serialized_index(&index)),
-            calls: Arc::clone(&calls),
-        };
-        let mut reader = IVFSQIndexReader::open(source).unwrap();
-        reader.optimize_for_search().unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "direct IVF-SQ open should use one header read and one resident-metadata read"
-        );
+    fn ivfsq_reader_entry_points_preserve_cache_policy_and_header_reads() {
+        use crate::index::VectorIndexReader;
+
+        let (index, data, _) = build_index(8, 8, 512);
+        let bytes = serialized_index(&index);
+        let query = &data[..8];
+        let expected = IVFSQIndexReader::open(Cursor::new(bytes.clone()))
+            .unwrap()
+            .search(query, 5, 8)
+            .unwrap();
+        for (unified, budget, cached) in [
+            (false, None, false),
+            (false, Some(0), false),
+            (false, Some(1), false),
+            (false, Some(1024 * 1024), true),
+            (true, None, true),
+            (true, Some(0), false),
+            (true, Some(1), false),
+            (true, Some(1024 * 1024), true),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let source = CountingReader {
+                inner: Cursor::new(bytes.clone()),
+                calls: Arc::clone(&calls),
+            };
+            let options = budget.map(VectorIndexReaderOptions::new);
+            let mut reader = if unified {
+                let reader = match options {
+                    Some(options) => VectorIndexReader::open_with_options(source, options),
+                    None => VectorIndexReader::open(source),
+                }
+                .unwrap();
+                let VectorIndexReader::IvfSq(reader) = reader else {
+                    panic!("SQ file must dispatch to the SQ reader");
+                };
+                reader
+            } else {
+                match options {
+                    Some(options) => IVFSQIndexReader::open_with_options(source, options),
+                    None => IVFSQIndexReader::open(source),
+                }
+                .unwrap()
+            };
+            reader.optimize_for_search().unwrap();
+            assert_eq!(
+                calls.swap(0, Ordering::Relaxed),
+                2,
+                "open should read the header and resident metadata exactly once"
+            );
+            assert_eq!(reader.search(query, 5, 8).unwrap(), expected);
+            assert_eq!(calls.swap(0, Ordering::Relaxed), 1);
+            assert_eq!(reader.search(query, 5, 8).unwrap(), expected);
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                usize::from(!cached),
+                "cache policy for unified={unified}, budget={budget:?}"
+            );
+        }
     }
 
     #[test]

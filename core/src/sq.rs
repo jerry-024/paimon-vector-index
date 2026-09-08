@@ -101,6 +101,54 @@ impl ScalarQuantizer {
         self.encode_batch(vector, 1, code);
     }
 
+    /// Gather and quantize a partition without materializing its residual matrix.
+    pub(crate) fn encode_residual_rows(
+        &self,
+        data: &[f32],
+        rows: &[usize],
+        offset: &[f32],
+        codes: &mut [u8],
+    ) {
+        assert_eq!(codes.len(), rows.len() * self.d);
+        assert_eq!(offset.len(), self.d);
+        assert_eq!(self.mins.len(), self.d);
+        assert_eq!(self.maxs.len(), self.d);
+        let scales = self
+            .mins
+            .iter()
+            .zip(&self.maxs)
+            .map(
+                |(&min, &max)| {
+                    if min < max {
+                        255.0 / (max - min)
+                    } else {
+                        0.0
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        for (&row, code) in rows.iter().zip(codes.chunks_exact_mut(self.d)) {
+            let vector = &data[row * self.d..(row + 1) * self.d];
+            encode_residual(vector, offset, &self.mins, &self.maxs, &scales, code);
+        }
+    }
+
+    pub(crate) fn train_residual_rows(data: &[f32], rows: &[usize], offset: &[f32]) -> Self {
+        let d = offset.len();
+        let mut mins = vec![f32::INFINITY; d];
+        let mut maxs = vec![f32::NEG_INFINITY; d];
+        // Subtraction is monotone: subtracting the centroid from the extrema
+        // gives exactly the extrema of the rounded residuals, with O(d) scratch.
+        for &row in rows {
+            update_bounds_batch(&data[row * d..(row + 1) * d], 1, d, &mut mins, &mut maxs);
+        }
+        for dim in 0..d {
+            mins[dim] -= offset[dim];
+            maxs[dim] -= offset[dim];
+        }
+        Self::with_dimension_bounds(d, mins, maxs)
+    }
+
     pub fn decode_batch(&self, codes: &[u8], n: usize, vectors: &mut [f32]) {
         let len = n * self.d;
         assert!(codes.len() >= len);
@@ -209,6 +257,7 @@ impl ScalarQuantizer {
         offset: &[f32],
         metric: MetricType,
         block_size: usize,
+        cutoff: f32,
         parameters: &mut Vec<f32>,
         distances: &mut Vec<f32>,
     ) {
@@ -226,7 +275,9 @@ impl ScalarQuantizer {
                 primary[dimension] = query[dimension] - offset[dimension] - self.mins[dimension];
                 scales[dimension] = (self.maxs[dimension] - self.mins[dimension]) * (1.0 / 255.0);
             }
-            blocked_sq_l2(primary, scales, codes, count, self.d, block_size, distances);
+            blocked_sq_l2(
+                primary, scales, codes, count, self.d, block_size, cutoff, distances,
+            );
             return;
         }
 
@@ -426,21 +477,24 @@ fn blocked_sq_l2(
     count: usize,
     d: usize,
     block_size: usize,
+    cutoff: f32,
     distances: &mut [f32],
 ) {
     #[cfg(target_arch = "x86_64")]
     if block_size == 32 && is_x86_feature_detected!("avx2") {
         unsafe {
-            return blocked_sq_l2_avx2(biases, scales, codes, count, d, distances);
+            return blocked_sq_l2_avx2(biases, scales, codes, count, d, cutoff, distances);
         }
     }
     #[cfg(target_arch = "aarch64")]
     if block_size == 32 {
         unsafe {
-            return blocked_sq_l2_neon(biases, scales, codes, count, d, distances);
+            return blocked_sq_l2_neon(biases, scales, codes, count, d, cutoff, distances);
         }
     }
-    blocked_sq_l2_scalar(biases, scales, codes, count, d, block_size, distances);
+    blocked_sq_l2_scalar(
+        biases, scales, codes, count, d, block_size, cutoff, distances,
+    );
 }
 
 fn blocked_sq_l2_scalar(
@@ -450,6 +504,7 @@ fn blocked_sq_l2_scalar(
     count: usize,
     d: usize,
     block_size: usize,
+    cutoff: f32,
     distances: &mut [f32],
 ) {
     let mut code_offset = 0usize;
@@ -457,14 +512,20 @@ fn blocked_sq_l2_scalar(
         let block_len = (count - block_start).min(block_size);
         let block_distances = &mut distances[block_start..block_start + block_len];
         block_distances.fill(0.0);
-        for dimension in 0..d {
-            let column = &codes
-                [code_offset + dimension * block_len..code_offset + (dimension + 1) * block_len];
-            let bias = biases[dimension];
-            let scale = scales[dimension];
-            for lane in 0..block_len {
-                let difference = bias - column[lane] as f32 * scale;
-                block_distances[lane] += difference * difference;
+        let checkpoint = (d / 2).max(32).min(d);
+        for (start, end) in [(0, checkpoint), (checkpoint, d)] {
+            if start > 0 && block_distances.iter().all(|&distance| distance >= cutoff) {
+                break;
+            }
+            for dimension in start..end {
+                let column = &codes[code_offset + dimension * block_len
+                    ..code_offset + (dimension + 1) * block_len];
+                let bias = biases[dimension];
+                let scale = scales[dimension];
+                for lane in 0..block_len {
+                    let difference = bias - column[lane] as f32 * scale;
+                    block_distances[lane] += difference * difference;
+                }
             }
         }
         code_offset += block_len * d;
@@ -479,6 +540,7 @@ unsafe fn blocked_sq_l2_neon(
     codes: &[u8],
     count: usize,
     d: usize,
+    cutoff: f32,
     distances: &mut [f32],
 ) {
     use std::arch::aarch64::*;
@@ -487,23 +549,29 @@ unsafe fn blocked_sq_l2_neon(
     for block_start in (0..full_count).step_by(32) {
         let code_base = block_start * d;
         let mut accumulators = [vdupq_n_f32(0.0); 8];
-        for dimension in 0..d {
-            let column = codes.as_ptr().add(code_base + dimension * 32);
-            let bias = vdupq_n_f32(biases[dimension]);
-            let scale = vdupq_n_f32(scales[dimension]);
-            for chunk in 0..4 {
-                let code_u16 = vmovl_u8(vld1_u8(column.add(chunk * 8)));
-                let code_low = vcvtq_f32_u32(vmovl_u16(vget_low_u16(code_u16)));
-                let code_high = vcvtq_f32_u32(vmovl_u16(vget_high_u16(code_u16)));
-                let difference_low = vfmsq_f32(bias, code_low, scale);
-                let difference_high = vfmsq_f32(bias, code_high, scale);
-                accumulators[chunk * 2] =
-                    vfmaq_f32(accumulators[chunk * 2], difference_low, difference_low);
-                accumulators[chunk * 2 + 1] = vfmaq_f32(
-                    accumulators[chunk * 2 + 1],
-                    difference_high,
-                    difference_high,
-                );
+        let checkpoint = (d / 2).max(32).min(d);
+        for (start, end) in [(0, checkpoint), (checkpoint, d)] {
+            if start > 0 && accumulators.iter().all(|&acc| vminvq_f32(acc) >= cutoff) {
+                break;
+            }
+            for dimension in start..end {
+                let column = codes.as_ptr().add(code_base + dimension * 32);
+                let bias = vdupq_n_f32(biases[dimension]);
+                let scale = vdupq_n_f32(scales[dimension]);
+                for chunk in 0..4 {
+                    let code_u16 = vmovl_u8(vld1_u8(column.add(chunk * 8)));
+                    let code_low = vcvtq_f32_u32(vmovl_u16(vget_low_u16(code_u16)));
+                    let code_high = vcvtq_f32_u32(vmovl_u16(vget_high_u16(code_u16)));
+                    let difference_low = vfmsq_f32(bias, code_low, scale);
+                    let difference_high = vfmsq_f32(bias, code_high, scale);
+                    accumulators[chunk * 2] =
+                        vfmaq_f32(accumulators[chunk * 2], difference_low, difference_low);
+                    accumulators[chunk * 2 + 1] = vfmaq_f32(
+                        accumulators[chunk * 2 + 1],
+                        difference_high,
+                        difference_high,
+                    );
+                }
             }
         }
         for (chunk, accumulator) in accumulators.into_iter().enumerate() {
@@ -521,6 +589,7 @@ unsafe fn blocked_sq_l2_neon(
             count - full_count,
             d,
             32,
+            cutoff,
             &mut distances[full_count..],
         );
     }
@@ -534,6 +603,7 @@ unsafe fn blocked_sq_l2_avx2(
     codes: &[u8],
     count: usize,
     d: usize,
+    cutoff: f32,
     distances: &mut [f32],
 ) {
     use std::arch::x86_64::*;
@@ -542,15 +612,27 @@ unsafe fn blocked_sq_l2_avx2(
     for block_start in (0..full_count).step_by(32) {
         let code_base = block_start * d;
         let mut accumulators = [_mm256_setzero_ps(); 4];
-        for dimension in 0..d {
-            let column = codes.as_ptr().add(code_base + dimension * 32);
-            let bias = _mm256_set1_ps(biases[dimension]);
-            let scale = _mm256_set1_ps(scales[dimension]);
-            for (chunk, accumulator) in accumulators.iter_mut().enumerate() {
-                let bytes = _mm_loadl_epi64(column.add(chunk * 8).cast());
-                let code = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
-                let difference = _mm256_sub_ps(bias, _mm256_mul_ps(code, scale));
-                *accumulator = _mm256_add_ps(*accumulator, _mm256_mul_ps(difference, difference));
+        let checkpoint = (d / 2).max(32).min(d);
+        for (start, end) in [(0, checkpoint), (checkpoint, d)] {
+            if start > 0
+                && accumulators.iter().all(|&acc| {
+                    _mm256_movemask_ps(_mm256_cmp_ps::<_CMP_GE_OQ>(acc, _mm256_set1_ps(cutoff)))
+                        == 255
+                })
+            {
+                break;
+            }
+            for dimension in start..end {
+                let column = codes.as_ptr().add(code_base + dimension * 32);
+                let bias = _mm256_set1_ps(biases[dimension]);
+                let scale = _mm256_set1_ps(scales[dimension]);
+                for (chunk, accumulator) in accumulators.iter_mut().enumerate() {
+                    let bytes = _mm_loadl_epi64(column.add(chunk * 8).cast());
+                    let code = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
+                    let difference = _mm256_sub_ps(bias, _mm256_mul_ps(code, scale));
+                    *accumulator =
+                        _mm256_add_ps(*accumulator, _mm256_mul_ps(difference, difference));
+                }
             }
         }
         for (chunk, accumulator) in accumulators.into_iter().enumerate() {
@@ -568,6 +650,7 @@ unsafe fn blocked_sq_l2_avx2(
             count - full_count,
             d,
             32,
+            cutoff,
             &mut distances[full_count..],
         );
     }
@@ -868,6 +951,131 @@ unsafe fn update_bounds_batch_neon(
             dim += 1;
         }
     }
+}
+
+fn encode_residual(
+    vector: &[f32],
+    offset: &[f32],
+    mins: &[f32],
+    maxs: &[f32],
+    scales: &[f32],
+    codes: &mut [u8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    let start = unsafe { encode_residual_neon(vector, offset, mins, scales, codes) };
+    #[cfg(target_arch = "x86_64")]
+    let start = if is_x86_feature_detected!("avx2") {
+        unsafe { encode_residual_avx2(vector, offset, mins, scales, codes) }
+    } else {
+        0
+    };
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let start = {
+        let _ = scales;
+        0
+    };
+    for dim in start..codes.len() {
+        codes[dim] = encode_value(vector[dim] - offset[dim], mins[dim], maxs[dim]);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn encode_residual_neon(
+    vector: &[f32],
+    offset: &[f32],
+    mins: &[f32],
+    scales: &[f32],
+    codes: &mut [u8],
+) -> usize {
+    use std::arch::aarch64::*;
+    let mut dim = 0;
+    while dim + 16 <= codes.len() {
+        let mut packed = [vdupq_n_u32(0); 4];
+        for (chunk, out) in packed.iter_mut().enumerate() {
+            let i = dim + chunk * 4;
+            let residual = vsubq_f32(
+                vld1q_f32(vector.as_ptr().add(i)),
+                vld1q_f32(offset.as_ptr().add(i)),
+            );
+            let value = vmulq_f32(
+                vsubq_f32(residual, vld1q_f32(mins.as_ptr().add(i))),
+                vld1q_f32(scales.as_ptr().add(i)),
+            );
+            *out = vcvtaq_u32_f32(vminq_f32(
+                vdupq_n_f32(255.0),
+                vmaxq_f32(vdupq_n_f32(0.0), value),
+            ));
+        }
+        let low = vcombine_u16(vmovn_u32(packed[0]), vmovn_u32(packed[1]));
+        let high = vcombine_u16(vmovn_u32(packed[2]), vmovn_u32(packed[3]));
+        vst1q_u8(
+            codes.as_mut_ptr().add(dim),
+            vcombine_u8(vmovn_u16(low), vmovn_u16(high)),
+        );
+        dim += 16;
+    }
+    // Keep the same four-dimension SIMD boundary as encode_batch.
+    while dim + 4 <= codes.len() {
+        let residual = vsubq_f32(
+            vld1q_f32(vector.as_ptr().add(dim)),
+            vld1q_f32(offset.as_ptr().add(dim)),
+        );
+        let value = vmulq_f32(
+            vsubq_f32(residual, vld1q_f32(mins.as_ptr().add(dim))),
+            vld1q_f32(scales.as_ptr().add(dim)),
+        );
+        let rounded = vcvtaq_u32_f32(vminq_f32(
+            vdupq_n_f32(255.0),
+            vmaxq_f32(vdupq_n_f32(0.0), value),
+        ));
+        let bytes = vmovn_u16(vcombine_u16(vmovn_u32(rounded), vdup_n_u16(0)));
+        codes[dim..dim + 4]
+            .copy_from_slice(&vget_lane_u32::<0>(vreinterpret_u32_u8(bytes)).to_le_bytes());
+        dim += 4;
+    }
+    dim
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn encode_residual_avx2(
+    vector: &[f32],
+    offset: &[f32],
+    mins: &[f32],
+    scales: &[f32],
+    codes: &mut [u8],
+) -> usize {
+    use std::arch::x86_64::*;
+    let mut dim = 0;
+    while dim + 8 <= codes.len() {
+        let residual = _mm256_sub_ps(
+            _mm256_loadu_ps(vector.as_ptr().add(dim)),
+            _mm256_loadu_ps(offset.as_ptr().add(dim)),
+        );
+        let value = _mm256_mul_ps(
+            _mm256_sub_ps(residual, _mm256_loadu_ps(mins.as_ptr().add(dim))),
+            _mm256_loadu_ps(scales.as_ptr().add(dim)),
+        );
+        let value = _mm256_min_ps(
+            _mm256_set1_ps(255.0),
+            _mm256_max_ps(_mm256_setzero_ps(), value),
+        );
+        let floor = _mm256_floor_ps(value);
+        let up = _mm256_cmp_ps::<_CMP_GE_OQ>(_mm256_sub_ps(value, floor), _mm256_set1_ps(0.5));
+        let rounded =
+            _mm256_cvttps_epi32(_mm256_add_ps(floor, _mm256_and_ps(up, _mm256_set1_ps(1.0))));
+        let words = _mm_packus_epi32(
+            _mm256_castsi256_si128(rounded),
+            _mm256_extracti128_si256::<1>(rounded),
+        );
+        _mm_storel_epi64(
+            codes.as_mut_ptr().add(dim).cast(),
+            _mm_packus_epi16(words, words),
+        );
+        dim += 8;
+    }
+    dim
 }
 
 fn encode_batch_simd(
@@ -1285,6 +1493,129 @@ impl DistanceContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn residual_encoder_matches_separate_subtraction_and_encoding() {
+        for d in [1, 3, 4, 7, 8, 15, 16, 17, 31, 32, 37, 128] {
+            let mins = (0..d)
+                .map(|j| if j % 5 == 0 { 7.0 } else { -2.0 })
+                .collect::<Vec<_>>();
+            let maxs = (0..d)
+                .map(|j| if j % 5 == 0 { 7.0 } else { 253.0 })
+                .collect::<Vec<_>>();
+            let sq = ScalarQuantizer::with_dimension_bounds(d, mins, maxs);
+            let offset = (0..d).map(|j| j as f32 * 0.25 - 4.0).collect::<Vec<_>>();
+            // Includes clipping, exact half-way rounding, and constant dimensions.
+            let levels = [-10.0, -2.0, -1.5, 0.5, 127.5, 252.5, 253.0, 260.0];
+            let data = (0..levels.len() * d)
+                .map(|i| levels[(i / d + i % d) % levels.len()] + offset[i % d])
+                .collect::<Vec<_>>();
+            let rows = [7, 0, 3, 2, 3, 6, 1, 5, 4];
+            let mut actual = vec![99; rows.len() * d];
+            sq.encode_residual_rows(&data, &rows, &offset, &mut actual);
+            let mut expected = vec![0; actual.len()];
+            for (&row, code) in rows.iter().zip(expected.chunks_exact_mut(d)) {
+                let residual = (0..d)
+                    .map(|j| data[row * d + j] - offset[j])
+                    .collect::<Vec<_>>();
+                sq.encode(&residual, code);
+            }
+            assert_eq!(actual, expected, "dimension {d}");
+        }
+    }
+
+    #[test]
+    fn residual_extrema_match_materialized_residuals() {
+        let d = 37;
+        let data = (0..19 * d)
+            .map(|i| ((i * 17 % 131) as f32 - 65.0) * 0.031)
+            .collect::<Vec<_>>();
+        let offset = (0..d).map(|j| j as f32 * 0.17 - 1.0).collect::<Vec<_>>();
+        let rows = [18, 1, 3, 7, 0, 1];
+        let actual = ScalarQuantizer::train_residual_rows(&data, &rows, &offset);
+        let residuals = rows
+            .iter()
+            .flat_map(|&row| {
+                (0..d)
+                    .map(|j| data[row * d + j] - offset[j])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut expected = ScalarQuantizer::new(d);
+        expected.train(&residuals, rows.len());
+        assert_eq!(actual.mins, expected.mins);
+        assert_eq!(actual.maxs, expected.maxs);
+    }
+
+    #[test]
+    fn blocked_l2_cutoff_preserves_every_competitive_distance() {
+        for d in [1, 31, 32, 33, 64, 65, 128] {
+            for count in [1, 31, 32, 33, 63, 64, 65, 97] {
+                for block_size in [7, 32] {
+                    let sq = ScalarQuantizer::with_bounds(d, 0.0, 255.0);
+                    let query = vec![0.0; d];
+                    let mut codes = Vec::new();
+                    for start in (0..count).step_by(block_size) {
+                        let len = (count - start).min(block_size);
+                        for dim in 0..d {
+                            for lane in 0..len {
+                                // One entire far block, and a lane whose distance
+                                // grows only in the last dimension, guard both sides.
+                                codes.push(if start < 32 {
+                                    20
+                                } else if lane == 0 {
+                                    if dim + 1 == d {
+                                        10
+                                    } else {
+                                        0
+                                    }
+                                } else {
+                                    1
+                                });
+                            }
+                        }
+                    }
+                    let mut parameters = Vec::new();
+                    let mut exact = Vec::new();
+                    sq.distances_to_blocked_codes_with_offset(
+                        &query,
+                        &codes,
+                        count,
+                        &query,
+                        MetricType::L2,
+                        block_size,
+                        f32::INFINITY,
+                        &mut parameters,
+                        &mut exact,
+                    );
+                    for cutoff in [0.0, 50.0, 100.0, 1000.0, f32::INFINITY] {
+                        let mut actual = Vec::new();
+                        sq.distances_to_blocked_codes_with_offset(
+                            &query,
+                            &codes,
+                            count,
+                            &query,
+                            MetricType::L2,
+                            block_size,
+                            cutoff,
+                            &mut parameters,
+                            &mut actual,
+                        );
+                        for (&full, &pruned) in exact.iter().zip(&actual) {
+                            if full < cutoff {
+                                assert_eq!(pruned, full);
+                            } else {
+                                assert!(
+                                    pruned >= cutoff,
+                                    "unsafe cutoff d={d}, count={count}, block={block_size}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_scalar_quantizer_round_trips_bounds() {
