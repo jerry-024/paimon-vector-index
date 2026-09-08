@@ -104,9 +104,11 @@ fn main() {
             .map(|_| rng.gen_range(-1.0f32..1.0))
             .collect(),
     );
-    index.pq.centroids = (0..M * index.pq.ksub * index.pq.dsub)
-        .map(|_| rng.gen_range(-1.0f32..1.0))
-        .collect();
+    index.pq.set_centroids(
+        (0..M * index.pq.ksub * index.pq.dsub)
+            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .collect(),
+    );
     for list_id in 0..NLIST {
         let first_id = list_id * ROWS_PER_LIST;
         index.ids[list_id] = (first_id..first_id + ROWS_PER_LIST)

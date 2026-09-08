@@ -338,7 +338,8 @@ impl DiskAnnIndex {
         let row_ids = checked_bytes(n, size_of::<i64>(), "row IDs")?;
         let row_id_encoding_scratch = row_id_encoding_scratch_bytes(n)?;
         let pq_codes = checked_bytes(n, self.pq.code_size(), "PQ codes")?;
-        let pq_codebook = checked_bytes(self.pq.centroids.len(), size_of::<f32>(), "PQ codebook")?;
+        let pq_codebook =
+            checked_bytes(self.pq.centroids().len(), size_of::<f32>(), "PQ codebook")?;
         let pq_build_distances = if self.build_params.build_distance
             == DiskAnnBuildDistance::ProductQuantized
         {
@@ -497,14 +498,14 @@ impl DiskAnnIndex {
             .ok_or_else(|| invalid_input("DiskANN PQ codebook shape overflows usize"))?;
         if self.pq.d != self.d
             || self.pq.ksub != expected_ksub
-            || self.pq.centroids.len() != expected_centroids
+            || self.pq.centroids().len() != expected_centroids
             || !self.pq.has_valid_layout()
         {
             return Err(invalid_input("DiskANN PQ codebook shape is invalid"));
         }
         if let Some(offset) = self
             .pq
-            .centroids
+            .centroids()
             .iter()
             .position(|value| !value.is_finite())
         {

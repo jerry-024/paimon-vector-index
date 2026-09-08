@@ -1433,10 +1433,8 @@ impl<R: SeekRead> DiskAnnIndexReader<R> {
             )));
         }
 
-        let (mut pq, row_ids, pq_codes, adjacency_index) =
+        let (pq, row_ids, pq_codes, adjacency_index) =
             read_resident_sections(&mut self.reader, &self.header)?;
-        pq.try_rebuild_norms_cache()
-            .map_err(|_| invalid_data("DiskANN PQ norms allocation failed"))?;
         validate_pq_code_padding(&self.header, &pq_codes)?;
         let adjacency_validation =
             AdjacencyValidationCache::new(adjacency_page_count(&self.header)?)?;
@@ -2619,7 +2617,7 @@ fn write_pq_codebook(
                 .to_le_bytes(),
         )?;
     }
-    for &value in &pq.centroids {
+    for &value in pq.centroids() {
         writer.write_bytes(&value.to_le_bytes())?;
     }
     Ok(())
@@ -3060,7 +3058,8 @@ fn decode_pq_codebook(bytes: &[u8], header: &DiskAnnHeader) -> io::Result<Produc
         }
         centroids.push(value);
     }
-    pq.centroids = centroids;
+    pq.try_set_centroids(centroids)
+        .map_err(|_| invalid_data("DiskANN PQ norms allocation failed"))?;
     if !pq.has_valid_layout() {
         return Err(invalid_data("invalid DiskANN PQ codebook layout"));
     }
@@ -4120,15 +4119,18 @@ mod tests {
                     ..DiskAnnBuildParams::default()
                 },
             );
-            index.pq.centroids = (0..256).map(|code| code as f32).collect();
-            index.pq.rebuild_norms_cache();
+            index
+                .pq
+                .set_centroids((0..256).map(|code| code as f32).collect());
             index.ids = vec![7];
             index.vectors = vec![0.0];
             index
         }
 
         let mut invalid_codebook = one_vector_index();
-        invalid_codebook.pq.centroids[0] = f32::NAN;
+        let mut centroids = invalid_codebook.pq.centroids().to_vec();
+        centroids[0] = f32::NAN;
+        invalid_codebook.pq.set_centroids(centroids);
         let mut codebook_output = Vec::new();
         assert!(
             write_diskann_index(&invalid_codebook, &mut PosWriter::new(&mut codebook_output))
@@ -4840,7 +4842,7 @@ mod tests {
         );
         assert_eq!(reader.row_id_count().unwrap(), indexed_count);
         assert_eq!(reader.pq_codes().unwrap().len(), indexed_count * 2);
-        assert_eq!(reader.pq().unwrap().centroids, index.pq.centroids);
+        assert_eq!(reader.pq().unwrap().centroids(), index.pq.centroids());
 
         let limited_rounds = Arc::new(Mutex::new(Vec::new()));
         let limited_recording = RoundRecordingReader {

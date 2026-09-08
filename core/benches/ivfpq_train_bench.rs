@@ -103,7 +103,7 @@ fn run_scenario(s: &Scenario) {
 
     // Keep results observable so nothing is optimized away.
     let checksum: f32 =
-        centroids.iter().take(8).sum::<f32>() + pq.centroids.iter().take(8).sum::<f32>();
+        centroids.iter().take(8).sum::<f32>() + pq.centroids().iter().take(8).sum::<f32>();
 
     println!(
         "{:<11} {:>8} {:>5} {:>6} {:>5} {:>8.3} {:>9.3} {:>8.3} {:>14.3}",

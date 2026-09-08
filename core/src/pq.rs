@@ -21,6 +21,7 @@ use crate::distance::{
 };
 use crate::kmeans::{self, KMeansConfig};
 use rayon::prelude::*;
+use std::sync::OnceLock;
 
 /// Product Quantizer aligned with Faiss's ProductQuantizer.
 ///
@@ -31,7 +32,8 @@ use rayon::prelude::*;
 ///
 /// Centroids are chunk-major. Chunk `m` starts at
 /// `chunk_offsets[m] * ksub`, and each of its `ksub` centroids contains
-/// `chunk_offsets[m + 1] - chunk_offsets[m]` contiguous components.
+/// `chunk_offsets[m + 1] - chunk_offsets[m]` contiguous components. Use
+/// [`Self::set_centroids`] to replace them so derived caches stay synchronized.
 pub struct ProductQuantizer {
     pub d: usize,
     pub m: usize,
@@ -41,10 +43,11 @@ pub struct ProductQuantizer {
     pub dsub: usize,
     pub ksub: usize,
     pub chunk_offsets: Vec<usize>,
-    pub centroids: Vec<f32>,
+    centroids: Vec<f32>,
     /// Pre-computed squared norms of each centroid: [M * ksub].
     /// Avoids recomputing per query for L2 distance table.
-    pub centroid_norms_cache: Vec<f32>,
+    centroid_norms_cache: Vec<f32>,
+    transposed_codebook_cache: OnceLock<(Vec<f32>, usize)>,
 }
 
 impl ProductQuantizer {
@@ -126,6 +129,7 @@ impl ProductQuantizer {
             chunk_offsets,
             centroids: Vec::new(),
             centroid_norms_cache: Vec::new(),
+            transposed_codebook_cache: OnceLock::new(),
         }
     }
 
@@ -153,6 +157,33 @@ impl ProductQuantizer {
                     && self.centroids.len() == self.d * self.ksub
             },
         )
+    }
+
+    /// Return the chunk-major PQ codebook.
+    pub fn centroids(&self) -> &[f32] {
+        &self.centroids
+    }
+
+    /// Replace the PQ codebook and refresh its derived norm and transpose caches.
+    pub fn set_centroids(&mut self, centroids: Vec<f32>) {
+        self.try_set_centroids(centroids)
+            .expect("PQ centroid norms allocation failed");
+    }
+
+    pub(crate) fn try_set_centroids(
+        &mut self,
+        centroids: Vec<f32>,
+    ) -> Result<(), std::collections::TryReserveError> {
+        assert_eq!(
+            centroids.len(),
+            self.d * self.ksub,
+            "PQ centroids must hold d * ksub values"
+        );
+        let norms = self.try_compute_centroid_norms(&centroids)?;
+        self.centroids = centroids;
+        self.centroid_norms_cache = norms;
+        self.transposed_codebook_cache.take();
+        Ok(())
     }
 
     /// Train the codebooks from training data.
@@ -243,23 +274,19 @@ impl ProductQuantizer {
                 .install(train_subquantizers)
         };
 
-        self.centroids = vec![0.0f32; d * ksub];
+        let mut centroids = vec![0.0f32; d * ksub];
         for (sub, sub_centroids) in sub_results.into_iter().enumerate() {
             let chunk_dim = self.chunk_dim(sub);
             let dst_offset = self.centroid_chunk_base(sub);
-            self.centroids[dst_offset..dst_offset + ksub * chunk_dim]
-                .copy_from_slice(&sub_centroids);
+            centroids[dst_offset..dst_offset + ksub * chunk_dim].copy_from_slice(&sub_centroids);
         }
-        self.rebuild_norms_cache();
+        self.set_centroids(centroids);
     }
 
-    /// Rebuild the centroid norms cache. Called after training or loading centroids.
-    pub fn rebuild_norms_cache(&mut self) {
-        self.try_rebuild_norms_cache()
-            .expect("PQ centroid norms allocation failed");
-    }
-
-    pub fn try_rebuild_norms_cache(&mut self) -> Result<(), std::collections::TryReserveError> {
+    fn try_compute_centroid_norms(
+        &self,
+        centroids: &[f32],
+    ) -> Result<Vec<f32>, std::collections::TryReserveError> {
         let mut norms = Vec::new();
         norms.try_reserve_exact(self.m * self.ksub)?;
         norms.resize(self.m * self.ksub, 0.0f32);
@@ -268,12 +295,10 @@ impl ProductQuantizer {
             let c_base = self.centroid_chunk_base(sub);
             for j in 0..self.ksub {
                 let c_off = c_base + j * chunk_dim;
-                norms[sub * self.ksub + j] =
-                    fvec_norm_l2sqr(&self.centroids[c_off..c_off + chunk_dim]);
+                norms[sub * self.ksub + j] = fvec_norm_l2sqr(&centroids[c_off..c_off + chunk_dim]);
             }
         }
-        self.centroid_norms_cache = norms;
-        Ok(())
+        Ok(norms)
     }
 
     /// Bytes per encoded vector.
@@ -511,7 +536,10 @@ impl ProductQuantizer {
         let cs = self.code_size();
         debug_assert_eq!(cs, m);
 
-        let (transposed, sub_stride) = self.build_transposed_codebook();
+        let (transposed, sub_stride) = self
+            .transposed_codebook_cache
+            .get_or_init(|| self.build_transposed_codebook());
+        let sub_stride = *sub_stride;
         let kernels: Vec<ScoreArgminKernel> = (0..m)
             .map(|sub| score_argmin_kernel(self.chunk_dim(sub), ksub))
             .collect();
@@ -1196,6 +1224,32 @@ mod tests {
     }
 
     #[test]
+    fn test_transposed_codebook_cache_reuses_and_invalidates() {
+        let (mut pq, mut rng) = trained_pq(32, 8, 20260908);
+        let data: Vec<f32> = (0..32).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let mut expected = vec![0u8; pq.code_size()];
+
+        assert!(pq.transposed_codebook_cache.get().is_none());
+        pq.encode_batch_8bit_transposed(&data, 1, &mut expected);
+        let cached = pq.transposed_codebook_cache.get().unwrap().0.as_ptr();
+
+        let mut actual = vec![0u8; pq.code_size()];
+        pq.encode_batch_8bit_transposed(&data, 1, &mut actual);
+        assert_eq!(actual, expected);
+        assert_eq!(
+            pq.transposed_codebook_cache.get().unwrap().0.as_ptr(),
+            cached
+        );
+
+        let centroids = pq.centroids().to_vec();
+        pq.set_centroids(centroids);
+        assert!(pq.transposed_codebook_cache.get().is_none());
+        pq.encode_batch_8bit_transposed(&data, 1, &mut actual);
+        assert_eq!(actual, expected);
+        assert!(pq.transposed_codebook_cache.get().is_some());
+    }
+
+    #[test]
     fn test_encode_batch_8bit_transposed_non_uniform_chunks() {
         let d = 13;
         let m = 3;
@@ -1219,9 +1273,10 @@ mod tests {
         // The expanded form cancels here; the direct form must still pick the
         // exact centroid, for every batch size.
         let mut pq = ProductQuantizer::new(4, 1);
-        pq.centroids = vec![100_000_016.0; pq.d * pq.ksub];
-        pq.centroids[0..4].fill(100_000_008.0);
-        pq.centroids[4..8].fill(100_000_000.0);
+        let mut centroids = vec![100_000_016.0; pq.d * pq.ksub];
+        centroids[0..4].fill(100_000_008.0);
+        centroids[4..8].fill(100_000_000.0);
+        pq.set_centroids(centroids);
 
         for n in BATCH_SIZES {
             let data = vec![100_000_000.0; n * pq.d];
@@ -1234,9 +1289,10 @@ mod tests {
     #[test]
     fn test_encode_batch_8bit_transposed_is_batch_invariant() {
         let mut pq = ProductQuantizer::new(4, 1);
-        pq.centroids = vec![100.0; pq.d * pq.ksub];
-        pq.centroids[0..4].copy_from_slice(&[0.3658799, 0.06077051, -0.46501994, -0.31766486]);
-        pq.centroids[4..8].copy_from_slice(&[0.3658799, 0.06077051, -0.46501994, -0.31766483]);
+        let mut centroids = vec![100.0; pq.d * pq.ksub];
+        centroids[0..4].copy_from_slice(&[0.3658799, 0.06077051, -0.46501994, -0.31766486]);
+        centroids[4..8].copy_from_slice(&[0.3658799, 0.06077051, -0.46501994, -0.31766483]);
+        pq.set_centroids(centroids);
 
         let max_n = *BATCH_SIZES.last().unwrap();
         let mut largest = vec![0; max_n];
@@ -1251,11 +1307,12 @@ mod tests {
     #[test]
     fn test_encode_batch_8bit_transposed_non_finite_semantics_are_batch_invariant() {
         let mut pq = ProductQuantizer::new(4, 1);
-        pq.centroids = vec![1.0; pq.d * pq.ksub];
-        pq.centroids[0..4].fill(f32::NAN);
-        pq.centroids[4..8].fill(0.0);
-        pq.centroids[8..12].fill(f32::INFINITY);
-        pq.centroids[12..16].fill(f32::NEG_INFINITY);
+        let mut centroids = vec![1.0; pq.d * pq.ksub];
+        centroids[0..4].fill(f32::NAN);
+        centroids[4..8].fill(0.0);
+        centroids[8..12].fill(f32::INFINITY);
+        centroids[12..16].fill(f32::NEG_INFINITY);
+        pq.set_centroids(centroids);
 
         for n in BATCH_SIZES {
             let mut codes = vec![0; n];
@@ -1263,7 +1320,7 @@ mod tests {
             assert!(codes.iter().all(|&code| code == 1), "n={n}");
         }
 
-        pq.centroids.fill(f32::NAN);
+        pq.set_centroids(vec![f32::NAN; pq.d * pq.ksub]);
         for n in BATCH_SIZES {
             let mut codes = vec![u8::MAX; n];
             pq.encode_batch_8bit_transposed(&vec![0.0; n * pq.d], n, &mut codes);
@@ -1564,8 +1621,7 @@ mod tests {
         let m = 1;
         let ksub = 256;
         let mut pq = ProductQuantizer::new(d, m);
-        pq.centroids = vec![0.0; ksub * d];
-
+        let mut centroids = vec![0.0; ksub * d];
         let mut query = vec![0.0; d];
         for i in 0..d {
             let value = if i.is_multiple_of(2) {
@@ -1574,9 +1630,9 @@ mod tests {
                 -1.0e10_f32 + i as f32
             };
             query[i] = value;
-            pq.centroids[i] = value;
+            centroids[i] = value;
         }
-        pq.rebuild_norms_cache();
+        pq.set_centroids(centroids);
 
         let mut table = vec![0.0; m * ksub];
         pq.compute_distance_table(&query, MetricType::L2, &mut table);

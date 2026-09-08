@@ -364,7 +364,7 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
     }
 
     write_f32_slice(out, index.quantizer_centroids())?;
-    write_f32_slice(out, &index.pq.centroids)?;
+    write_f32_slice(out, index.pq.centroids())?;
 
     // Compute offsets for inverted lists
     // Delta-varint format per list: [base_id: i64][id_bytes_len: u32][id_bytes][codes]
@@ -640,16 +640,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
             total_vectors,
             opq: None,
             quantizer_centroids: Vec::new(),
-            pq: ProductQuantizer {
-                d,
-                m,
-                nbits: ksub.trailing_zeros() as usize,
-                dsub,
-                ksub,
-                chunk_offsets: (0..=m).map(|chunk| chunk * dsub).collect(),
-                centroids: Vec::new(),
-                centroid_norms_cache: Vec::new(),
-            },
+            pq: ProductQuantizer::with_nbits(d, m, ksub.trailing_zeros() as usize),
             list_offsets: Vec::new(),
             list_counts: Vec::new(),
             list_id_bytes_lens: Vec::new(),
@@ -743,17 +734,7 @@ impl<R: SeekRead> IVFPQIndexReader<R> {
 
         let pq_centroids = bytes_to_f32_vec(&metadata[position..position + pq_centroid_bytes])?;
         position += pq_centroid_bytes;
-        self.pq = ProductQuantizer {
-            d,
-            m,
-            nbits: ksub.trailing_zeros() as usize,
-            dsub,
-            ksub,
-            chunk_offsets: (0..=m).map(|chunk| chunk * dsub).collect(),
-            centroids: pq_centroids,
-            centroid_norms_cache: Vec::new(),
-        };
-        self.pq.rebuild_norms_cache();
+        self.pq.set_centroids(pq_centroids);
 
         self.list_offsets = vec![0i64; nlist];
         self.list_counts = vec![0i32; nlist];
@@ -1247,7 +1228,7 @@ fn compute_precomputed_table(
                     let pq_off = pq_base + j * dsub;
                     let mut ip = 0.0f32;
                     for dd in 0..dsub {
-                        ip += sub_centroid[dd] * pq.centroids[pq_off + dd];
+                        ip += sub_centroid[dd] * pq.centroids()[pq_off + dd];
                     }
                     list_table[sub * ksub + j] = pq_norms[sub * ksub + j] + 2.0 * ip;
                 }

@@ -350,8 +350,9 @@ fn build_diskann_fixture() -> Vec<u8> {
             ..DiskAnnBuildParams::default()
         },
     );
-    index.pq.centroids = (0..256).map(|code| code as f32 * 0.25).collect();
-    index.pq.rebuild_norms_cache();
+    index
+        .pq
+        .set_centroids((0..256).map(|code| code as f32 * 0.25).collect());
     index.ids = vec![7];
     index.vectors = vec![0.0];
     write_diskann_fixture(index)
@@ -375,10 +376,13 @@ fn build_diskann_compact_multipage_fixture() -> Vec<u8> {
             ..DiskAnnBuildParams::default()
         },
     );
-    index.pq.centroids = (0..dimension)
-        .flat_map(|coordinate| (0..256).map(move |code| code as f32 + coordinate as f32 * 0.001))
-        .collect();
-    index.pq.rebuild_norms_cache();
+    index.pq.set_centroids(
+        (0..dimension)
+            .flat_map(|coordinate| {
+                (0..256).map(move |code| code as f32 + coordinate as f32 * 0.001)
+            })
+            .collect(),
+    );
     index.ids = (0..count).map(|node| 10_000 + node as i64 * 7).collect();
     index.vectors = (0..count)
         .flat_map(|node| {
@@ -423,12 +427,13 @@ fn build_diskann_interleaved_4bit_fixture() -> Vec<u8> {
             ..DiskAnnBuildParams::default()
         },
     );
-    index.pq.centroids = (0..dimension)
-        .flat_map(|coordinate| {
-            (0..16).map(move |code| code as f32 * 0.5 + coordinate as f32 * 0.001)
-        })
-        .collect();
-    index.pq.rebuild_norms_cache();
+    index.pq.set_centroids(
+        (0..dimension)
+            .flat_map(|coordinate| {
+                (0..16).map(move |code| code as f32 * 0.5 + coordinate as f32 * 0.001)
+            })
+            .collect(),
+    );
     index.ids = (0..count).map(|node| -500 + node as i64 * 11).collect();
     index.vectors = (0..count)
         .flat_map(|node| {
@@ -454,8 +459,9 @@ fn build_diskann_raw_row_ids_fixture() -> Vec<u8> {
             ..DiskAnnBuildParams::default()
         },
     );
-    index.pq.centroids = (0..256).map(|code| code as f32).collect();
-    index.pq.rebuild_norms_cache();
+    index
+        .pq
+        .set_centroids((0..256).map(|code| code as f32).collect());
     index.ids = vec![i64::MIN, 0, i64::MAX];
     index.vectors = vec![0.0, 1.0, 2.0];
     write_diskann_fixture(index)
@@ -488,8 +494,9 @@ fn build_ivf_flat_fixture() -> Vec<u8> {
 fn build_ivf_pq_fixture() -> Vec<u8> {
     let mut index = IVFPQIndex::new(1, 2, 1, MetricType::L2, false);
     index.set_quantizer_centroids(vec![0.0, 10.0]);
-    index.pq.centroids = (0..index.pq.ksub).map(|code| code as f32 * 0.25).collect();
-    index.pq.rebuild_norms_cache();
+    index
+        .pq
+        .set_centroids((0..index.pq.ksub).map(|code| code as f32 * 0.25).collect());
     index.ids = vec![vec![20, 10], vec![30]];
     index.codes = vec![vec![1, 0], vec![0]];
 
@@ -501,10 +508,11 @@ fn build_ivf_pq_fixture() -> Vec<u8> {
 fn build_ivf_pq_4bit_fixture() -> Vec<u8> {
     let mut index = IVFPQIndex::with_nbits(2, 2, 2, 4, MetricType::L2, false);
     index.set_quantizer_centroids(vec![0.0, 0.0, 10.0, 10.0]);
-    index.pq.centroids = (0..index.pq.m)
-        .flat_map(|_| (0..index.pq.ksub).map(|code| code as f32 * 0.5))
-        .collect();
-    index.pq.rebuild_norms_cache();
+    index.pq.set_centroids(
+        (0..index.pq.m)
+            .flat_map(|_| (0..index.pq.ksub).map(|code| code as f32 * 0.5))
+            .collect(),
+    );
     index.ids = vec![vec![8, 5], vec![30]];
     index.codes = vec![vec![0x11, 0x00], vec![0x00]];
 

@@ -4372,9 +4372,10 @@ mod tests {
                 unreachable!()
             };
             index.set_quantizer_centroids(vec![0.0; 4]);
-            index.pq.centroids = vec![100_000_016.0; 4 * 256];
-            index.pq.centroids[0..4].fill(100_000_008.0);
-            index.pq.centroids[4..8].fill(100_000_000.0);
+            let mut centroids = vec![100_000_016.0; 4 * 256];
+            centroids[0..4].fill(100_000_008.0);
+            centroids[4..8].fill(100_000_000.0);
+            index.pq.set_centroids(centroids);
             index.add(&[100_000_000.0; 4], &[0], 1);
             index.codes[0][0]
         };

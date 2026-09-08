@@ -106,16 +106,10 @@ const CASES: [Case; 10] = [
     },
 ];
 
-fn new_index(
-    case: Case,
-    quantizer_centroids: &[f32],
-    centroids: &[f32],
-    norms: &[f32],
-) -> IVFPQIndex {
+fn new_index(case: Case, quantizer_centroids: &[f32], centroids: &[f32]) -> IVFPQIndex {
     let mut index = IVFPQIndex::new(case.d, case.nlist, case.m, MetricType::L2, false);
     index.set_quantizer_centroids(quantizer_centroids.to_vec());
-    index.pq.centroids = centroids.to_vec();
-    index.pq.centroid_norms_cache = norms.to_vec();
+    index.pq.set_centroids(centroids.to_vec());
     index
 }
 
@@ -138,11 +132,6 @@ fn bench_ivfpq_add(c: &mut Criterion) {
         let centroids = (0..case.m * 256 * dsub)
             .map(|_| rng.gen_range(-1.0f32..1.0))
             .collect::<Vec<_>>();
-        let norms = centroids
-            .chunks_exact(dsub)
-            .map(|centroid| centroid.iter().map(|value| value * value).sum())
-            .collect::<Vec<_>>();
-
         group.throughput(Throughput::Elements(case.rows as u64));
         group.bench_with_input(
             BenchmarkId::new(
@@ -155,7 +144,7 @@ fn bench_ivfpq_add(c: &mut Criterion) {
             &case,
             |b, &case| {
                 b.iter_batched(
-                    || new_index(case, &quantizer_centroids, &centroids, &norms),
+                    || new_index(case, &quantizer_centroids, &centroids),
                     |mut index| index.add(black_box(&data), black_box(&ids), case.rows),
                     BatchSize::LargeInput,
                 );

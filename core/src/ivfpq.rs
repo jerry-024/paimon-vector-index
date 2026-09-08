@@ -180,22 +180,15 @@ impl IVFPQIndex {
     /// The new index has empty inverted lists — call `add()` to populate.
     /// Used for distributed build: train once globally, then each worker creates from_trained.
     pub fn from_trained(trained: &IVFPQIndex) -> Self {
+        let mut pq = ProductQuantizer::with_nbits(trained.pq.d, trained.pq.m, trained.pq.nbits);
+        pq.set_centroids(trained.pq.centroids().to_vec());
         let mut index = IVFPQIndex {
             d: trained.d,
             nlist: trained.nlist,
             metric: trained.metric,
             by_residual: trained.by_residual,
             quantizer_centroids: trained.quantizer_centroids.clone(),
-            pq: ProductQuantizer {
-                d: trained.pq.d,
-                m: trained.pq.m,
-                nbits: trained.pq.nbits,
-                dsub: trained.pq.dsub,
-                ksub: trained.pq.ksub,
-                chunk_offsets: trained.pq.chunk_offsets.clone(),
-                centroids: trained.pq.centroids.clone(),
-                centroid_norms_cache: trained.pq.centroid_norms_cache.clone(),
-            },
+            pq,
             opq: trained.opq.as_ref().map(|o| OPQMatrix {
                 d: o.d,
                 m: o.m,
@@ -386,7 +379,7 @@ impl IVFPQIndex {
                             let pq_off = pq_base + j * self.pq.dsub;
                             let ip = fvec_inner_product(
                                 sub_centroid,
-                                &self.pq.centroids[pq_off..pq_off + self.pq.dsub],
+                                &self.pq.centroids()[pq_off..pq_off + self.pq.dsub],
                             );
                             list_table[sub * ksub + j] = pq_norms[sub * ksub + j] + 2.0 * ip;
                         }
@@ -840,7 +833,7 @@ impl IVFPQIndex {
         if self.quantizer_centroids != other.quantizer_centroids {
             return Err(invalid_merge_input("coarse centroids mismatch"));
         }
-        if self.pq.centroids != other.pq.centroids {
+        if self.pq.centroids() != other.pq.centroids() {
             return Err(invalid_merge_input("PQ codebooks mismatch"));
         }
 
@@ -1062,8 +1055,8 @@ fn fill_list_precomputed_table(
             let pq_offset = pq_base + code * chunk_dim;
             let mut inner_product = 0.0f32;
             for dimension in 0..chunk_dim {
-                inner_product +=
-                    coarse_centroid[range.start + dimension] * pq.centroids[pq_offset + dimension];
+                inner_product += coarse_centroid[range.start + dimension]
+                    * pq.centroids()[pq_offset + dimension];
             }
             let table_offset = sub * pq.ksub + code;
             table[table_offset] = pq_norms[table_offset] + 2.0 * inner_product;
@@ -1081,7 +1074,7 @@ fn compute_stable_ephemeral_pq_norms(pq: &ProductQuantizer) -> Vec<f64> {
             let pq_offset = pq_base + code * chunk_dim;
             norms[sub * pq.ksub + code] = (0..chunk_dim)
                 .map(|dimension| {
-                    let value = f64::from(pq.centroids[pq_offset + dimension]);
+                    let value = f64::from(pq.centroids()[pq_offset + dimension]);
                     value * value
                 })
                 .sum();
@@ -1105,7 +1098,7 @@ fn fill_stable_ephemeral_list_table(
             let pq_offset = pq_base + code * chunk_dim;
             let mut inner_product = 0.0f64;
             for dimension in 0..chunk_dim {
-                let pq_value = f64::from(pq.centroids[pq_offset + dimension]);
+                let pq_value = f64::from(pq.centroids()[pq_offset + dimension]);
                 inner_product += f64::from(coarse_centroid[range.start + dimension]) * pq_value;
             }
             let offset = sub * pq.ksub + code;
@@ -1125,7 +1118,7 @@ fn fill_stable_ephemeral_query_table(query: &[f32], pq: &ProductQuantizer, table
             let mut inner_product = 0.0f64;
             for dimension in 0..chunk_dim {
                 inner_product += f64::from(query[range.start + dimension])
-                    * f64::from(pq.centroids[pq_offset + dimension]);
+                    * f64::from(pq.centroids()[pq_offset + dimension]);
             }
             table[sub * pq.ksub + code] = inner_product;
         }
@@ -3387,9 +3380,10 @@ mod tests {
         let mut trainer = IVFPQIndex::new(4, 1, 1, MetricType::L2, false);
         assert!(!trainer.canonical_pq_encoding);
         trainer.set_quantizer_centroids(vec![0.0; 4]);
-        trainer.pq.centroids = vec![100_000_016.0; 4 * 256];
-        trainer.pq.centroids[0..4].fill(100_000_008.0);
-        trainer.pq.centroids[4..8].fill(100_000_000.0);
+        let mut centroids = vec![100_000_016.0; 4 * 256];
+        centroids[0..4].fill(100_000_008.0);
+        centroids[4..8].fill(100_000_000.0);
+        trainer.pq.set_centroids(centroids);
         trainer.set_canonical_pq_encoding(true);
 
         let n = 7;
@@ -3479,7 +3473,9 @@ mod tests {
         assert_invalid_merge(&base, &mismatched_centroids, "coarse centroids mismatch");
 
         let mut mismatched_codebooks = IVFPQIndex::from_trained(&trainer);
-        mismatched_codebooks.pq.centroids[0] += 1.0;
+        let mut centroids = mismatched_codebooks.pq.centroids().to_vec();
+        centroids[0] += 1.0;
+        mismatched_codebooks.pq.set_centroids(centroids);
         assert_invalid_merge(&base, &mismatched_codebooks, "PQ codebooks mismatch");
 
         let mismatched_opq = IVFPQIndex::new(d, nlist, m, MetricType::L2, true);
