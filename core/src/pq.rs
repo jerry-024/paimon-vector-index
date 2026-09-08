@@ -186,6 +186,21 @@ impl ProductQuantizer {
         Ok(())
     }
 
+    /// Copy trained state while leaving the writer-local transpose lazy.
+    pub(crate) fn clone_without_transposed_cache(&self) -> Self {
+        Self {
+            d: self.d,
+            m: self.m,
+            nbits: self.nbits,
+            dsub: self.dsub,
+            ksub: self.ksub,
+            chunk_offsets: self.chunk_offsets.clone(),
+            centroids: self.centroids.clone(),
+            centroid_norms_cache: self.centroid_norms_cache.clone(),
+            transposed_codebook_cache: OnceLock::new(),
+        }
+    }
+
     /// Train the codebooks from training data.
     /// data: flat [n * d], n training vectors.
     pub fn train(&mut self, data: &[f32], n: usize) {

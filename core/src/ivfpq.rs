@@ -180,15 +180,13 @@ impl IVFPQIndex {
     /// The new index has empty inverted lists — call `add()` to populate.
     /// Used for distributed build: train once globally, then each worker creates from_trained.
     pub fn from_trained(trained: &IVFPQIndex) -> Self {
-        let mut pq = ProductQuantizer::with_nbits(trained.pq.d, trained.pq.m, trained.pq.nbits);
-        pq.set_centroids(trained.pq.centroids().to_vec());
         let mut index = IVFPQIndex {
             d: trained.d,
             nlist: trained.nlist,
             metric: trained.metric,
             by_residual: trained.by_residual,
             quantizer_centroids: trained.quantizer_centroids.clone(),
-            pq,
+            pq: trained.pq.clone_without_transposed_cache(),
             opq: trained.opq.as_ref().map(|o| OPQMatrix {
                 d: o.d,
                 m: o.m,
