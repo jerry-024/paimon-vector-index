@@ -330,7 +330,7 @@ impl IVFPQIndex {
     /// Build fastscan block codes for 4-bit search acceleration.
     /// Call after all vectors are added. Lightweight — only reorganizes existing codes.
     pub fn build_search_structures(&mut self) {
-        if self.pq.nbits == 4 {
+        if self.pq.nbits() == 4 {
             let cs = self.pq.code_size();
             self.fastscan_codes = self
                 .codes
@@ -353,8 +353,8 @@ impl IVFPQIndex {
     /// Costs ~10ms to build and uses nlist * M * ksub * 4 bytes of memory.
     pub fn build_precomputed_table(&mut self) {
         let d = self.d;
-        let m = self.pq.m;
-        let ksub = self.pq.ksub;
+        let m = self.pq.m();
+        let ksub = self.pq.ksub();
         let nlist = self.nlist;
 
         if self.metric != MetricType::L2 || !self.by_residual {
@@ -370,14 +370,15 @@ impl IVFPQIndex {
                 .for_each(|(i, list_table)| {
                     let centroid = &self.quantizer_centroids[i * d..(i + 1) * d];
                     for sub in 0..m {
-                        let sub_centroid = &centroid[sub * self.pq.dsub..(sub + 1) * self.pq.dsub];
-                        let pq_base = sub * ksub * self.pq.dsub;
+                        let sub_centroid =
+                            &centroid[sub * self.pq.dsub()..(sub + 1) * self.pq.dsub()];
+                        let pq_base = sub * ksub * self.pq.dsub();
 
                         for j in 0..ksub {
-                            let pq_off = pq_base + j * self.pq.dsub;
+                            let pq_off = pq_base + j * self.pq.dsub();
                             let ip = fvec_inner_product(
                                 sub_centroid,
-                                &self.pq.centroids()[pq_off..pq_off + self.pq.dsub],
+                                &self.pq.centroids()[pq_off..pq_off + self.pq.dsub()],
                             );
                             list_table[sub * ksub + j] = pq_norms[sub * ksub + j] + 2.0 * ip;
                         }
@@ -421,8 +422,8 @@ impl IVFPQIndex {
         result_labels: &mut [i64],
     ) {
         let d = self.d;
-        let m = self.pq.m;
-        let ksub = self.pq.ksub;
+        let m = self.pq.m();
+        let ksub = self.pq.ksub();
 
         let processed_queries = self.preprocess_queries(queries, nq);
 
@@ -436,7 +437,7 @@ impl IVFPQIndex {
         );
 
         let use_precomputed = !self.precomputed_table.is_empty();
-        let use_fastscan = !self.fastscan_codes.is_empty() && self.pq.nbits == 4;
+        let use_fastscan = !self.fastscan_codes.is_empty() && self.pq.nbits() == 4;
         let matching_rows_by_list = filter.map(|filter| {
             let mut probed_lists = vec![false; self.nlist];
             for probe_indices in &all_probe_indices {
@@ -532,7 +533,7 @@ impl IVFPQIndex {
                                 heap.push(dis0 + dists[i], self.ids[list_id][i]);
                             }
                         }
-                    } else if self.pq.nbits == 4 {
+                    } else if self.pq.nbits() == 4 {
                         scan_codes_4bit(
                             &sim_table,
                             &self.codes[list_id],
@@ -629,8 +630,8 @@ impl IVFPQIndex {
         result_labels: &mut [i64],
     ) {
         let d = self.d;
-        let m = self.pq.m;
-        let ksub = self.pq.ksub;
+        let m = self.pq.m();
+        let ksub = self.pq.ksub();
 
         let processed_queries = self.preprocess_queries(queries, nq);
         let (all_probe_indices, all_coarse_dists) = kmeans::find_topk_batch(
@@ -643,7 +644,7 @@ impl IVFPQIndex {
         );
 
         let use_precomputed = !self.precomputed_table.is_empty();
-        let use_fastscan = !self.fastscan_codes.is_empty() && self.pq.nbits == 4;
+        let use_fastscan = !self.fastscan_codes.is_empty() && self.pq.nbits() == 4;
 
         let results: Vec<Vec<(f32, i64)>> = (0..nq)
             .into_par_iter()
@@ -705,7 +706,7 @@ impl IVFPQIndex {
                         for i in 0..scan_count {
                             heap.push(dis0 + dists[i], self.ids[list_id][i]);
                         }
-                    } else if self.pq.nbits == 4 {
+                    } else if self.pq.nbits() == 4 {
                         scan_codes_4bit(
                             &sim_table,
                             &self.codes[list_id],
@@ -794,24 +795,24 @@ impl IVFPQIndex {
                 self.by_residual, other.by_residual
             )));
         }
-        if self.pq.d != other.pq.d
-            || self.pq.m != other.pq.m
-            || self.pq.nbits != other.pq.nbits
-            || self.pq.dsub != other.pq.dsub
-            || self.pq.ksub != other.pq.ksub
+        if self.pq.d() != other.pq.d()
+            || self.pq.m() != other.pq.m()
+            || self.pq.nbits() != other.pq.nbits()
+            || self.pq.dsub() != other.pq.dsub()
+            || self.pq.ksub() != other.pq.ksub()
         {
             return Err(invalid_merge_input(format!(
                 "PQ layout mismatch: self=(d={}, m={}, nbits={}, dsub={}, ksub={}), other=(d={}, m={}, nbits={}, dsub={}, ksub={})",
-                self.pq.d,
-                self.pq.m,
-                self.pq.nbits,
-                self.pq.dsub,
-                self.pq.ksub,
-                other.pq.d,
-                other.pq.m,
-                other.pq.nbits,
-                other.pq.dsub,
-                other.pq.ksub
+                self.pq.d(),
+                self.pq.m(),
+                self.pq.nbits(),
+                self.pq.dsub(),
+                self.pq.ksub(),
+                other.pq.d(),
+                other.pq.m(),
+                other.pq.nbits(),
+                other.pq.dsub(),
+                other.pq.ksub()
             )));
         }
         if self.opq.is_some() != other.opq.is_some() {
@@ -1042,35 +1043,35 @@ fn fill_list_precomputed_table(
     pq_norms: &[f32],
     table: &mut Vec<f32>,
 ) {
-    debug_assert_eq!(coarse_centroid.len(), pq.d);
-    debug_assert_eq!(pq_norms.len(), pq.m * pq.ksub);
-    table.resize(pq.m * pq.ksub, 0.0);
-    for sub in 0..pq.m {
+    debug_assert_eq!(coarse_centroid.len(), pq.d());
+    debug_assert_eq!(pq_norms.len(), pq.m() * pq.ksub());
+    table.resize(pq.m() * pq.ksub(), 0.0);
+    for sub in 0..pq.m() {
         let range = pq.chunk_range(sub);
         let chunk_dim = range.len();
-        let pq_base = range.start * pq.ksub;
-        for code in 0..pq.ksub {
+        let pq_base = range.start * pq.ksub();
+        for code in 0..pq.ksub() {
             let pq_offset = pq_base + code * chunk_dim;
             let mut inner_product = 0.0f32;
             for dimension in 0..chunk_dim {
                 inner_product += coarse_centroid[range.start + dimension]
                     * pq.centroids()[pq_offset + dimension];
             }
-            let table_offset = sub * pq.ksub + code;
+            let table_offset = sub * pq.ksub() + code;
             table[table_offset] = pq_norms[table_offset] + 2.0 * inner_product;
         }
     }
 }
 
 fn compute_stable_ephemeral_pq_norms(pq: &ProductQuantizer) -> Vec<f64> {
-    let mut norms = vec![0.0f64; pq.m * pq.ksub];
-    for sub in 0..pq.m {
+    let mut norms = vec![0.0f64; pq.m() * pq.ksub()];
+    for sub in 0..pq.m() {
         let range = pq.chunk_range(sub);
         let chunk_dim = range.len();
-        let pq_base = range.start * pq.ksub;
-        for code in 0..pq.ksub {
+        let pq_base = range.start * pq.ksub();
+        for code in 0..pq.ksub() {
             let pq_offset = pq_base + code * chunk_dim;
-            norms[sub * pq.ksub + code] = (0..chunk_dim)
+            norms[sub * pq.ksub() + code] = (0..chunk_dim)
                 .map(|dimension| {
                     let value = f64::from(pq.centroids()[pq_offset + dimension]);
                     value * value
@@ -1087,38 +1088,38 @@ fn fill_stable_ephemeral_list_table(
     pq_norms: &[f64],
     table: &mut Vec<f64>,
 ) {
-    table.resize(pq.m * pq.ksub, 0.0);
-    for sub in 0..pq.m {
+    table.resize(pq.m() * pq.ksub(), 0.0);
+    for sub in 0..pq.m() {
         let range = pq.chunk_range(sub);
         let chunk_dim = range.len();
-        let pq_base = range.start * pq.ksub;
-        for code in 0..pq.ksub {
+        let pq_base = range.start * pq.ksub();
+        for code in 0..pq.ksub() {
             let pq_offset = pq_base + code * chunk_dim;
             let mut inner_product = 0.0f64;
             for dimension in 0..chunk_dim {
                 let pq_value = f64::from(pq.centroids()[pq_offset + dimension]);
                 inner_product += f64::from(coarse_centroid[range.start + dimension]) * pq_value;
             }
-            let offset = sub * pq.ksub + code;
+            let offset = sub * pq.ksub() + code;
             table[offset] = pq_norms[offset] + 2.0 * inner_product;
         }
     }
 }
 
 fn fill_stable_ephemeral_query_table(query: &[f32], pq: &ProductQuantizer, table: &mut Vec<f64>) {
-    table.resize(pq.m * pq.ksub, 0.0);
-    for sub in 0..pq.m {
+    table.resize(pq.m() * pq.ksub(), 0.0);
+    for sub in 0..pq.m() {
         let range = pq.chunk_range(sub);
         let chunk_dim = range.len();
-        let pq_base = range.start * pq.ksub;
-        for code in 0..pq.ksub {
+        let pq_base = range.start * pq.ksub();
+        for code in 0..pq.ksub() {
             let pq_offset = pq_base + code * chunk_dim;
             let mut inner_product = 0.0f64;
             for dimension in 0..chunk_dim {
                 inner_product += f64::from(query[range.start + dimension])
                     * f64::from(pq.centroids()[pq_offset + dimension]);
             }
-            table[sub * pq.ksub + code] = inner_product;
+            table[sub * pq.ksub() + code] = inner_product;
         }
     }
 }
@@ -1131,16 +1132,16 @@ fn combine_stable_ephemeral_tables(
     pq: &ProductQuantizer,
     sim_table: &mut Vec<f32>,
 ) {
-    sim_table.resize(pq.m * pq.ksub, 0.0);
-    for sub in 0..pq.m {
+    sim_table.resize(pq.m() * pq.ksub(), 0.0);
+    for sub in 0..pq.m() {
         let range = pq.chunk_range(sub);
         let mut residual_norm = 0.0f64;
         for dimension in range {
             let residual = f64::from(query[dimension]) - f64::from(coarse_centroid[dimension]);
             residual_norm += residual * residual;
         }
-        let table_base = sub * pq.ksub;
-        for code in 0..pq.ksub {
+        let table_base = sub * pq.ksub();
+        for code in 0..pq.ksub() {
             let offset = table_base + code;
             sim_table[offset] =
                 (residual_norm + list_table[offset] - 2.0 * query_table[offset]).max(0.0) as f32;
@@ -1539,7 +1540,7 @@ pub fn search_with_reader_filter<R: SeekRead>(
             let (_, _, dis0) = lists_to_read[batch_start];
             let sim_table = by_residual
                 .then(|| reader_sim_table(reader, first_list, &q, &ip_table, use_precomputed));
-            let pq_nbits = reader.pq.nbits;
+            let pq_nbits = reader.pq.nbits();
             let transposed_codes = reader.transposed_codes;
             let mut scratch = ReaderScanScratch::default();
             reader.for_each_streamed_list_chunk(first_list, |pq, ids, codes| {
@@ -1682,7 +1683,7 @@ fn scan_reader_list(
         &entry.ids,
         ctx.m,
         ctx.ksub,
-        ctx.pq.nbits,
+        ctx.pq.nbits(),
         ctx.transposed_codes,
         dis0,
         matching_rows,
@@ -2282,7 +2283,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
         && by_residual
         && !reader.precomputed_table.is_empty()
         && reused_query_tables_fit_budget;
-    let allow_ephemeral_precomputed = reader.pq.nbits == 8
+    let allow_ephemeral_precomputed = reader.pq.nbits() == 8
         && metric == MetricType::L2
         && by_residual
         && !use_precomputed
@@ -2307,7 +2308,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
     };
     // Non-residual tables depend only on the query and PQ codebook, so every
     // probed list for that query can share one table.
-    let reuse_non_residual_tables = reader.pq.nbits == 8
+    let reuse_non_residual_tables = reader.pq.nbits() == 8
         && !by_residual
         && probe_end - probe_start > 1
         && match reuse_mode {
@@ -2383,7 +2384,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                         })
                 })
                 .collect::<Vec<_>>();
-            let pq_nbits = reader.pq.nbits;
+            let pq_nbits = reader.pq.nbits();
             let transposed_codes = reader.transposed_codes;
             // The loop is sequential across queries. Reuse one chunk-sized
             // distance buffer instead of retaining one per query.
@@ -2479,7 +2480,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                         .get(list.list_id as u32)
                         .copied()
                         .unwrap_or_default(),
-                    reader.pq.nbits,
+                    reader.pq.nbits(),
                     reader.transposed_codes,
                 );
             }
@@ -2623,7 +2624,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
                             &loaded_lists[position].ids,
                             m,
                             ksub,
-                            reader.pq.nbits,
+                            reader.pq.nbits(),
                             reader.transposed_codes,
                             dis0,
                             matching_rows_by_list[position].as_ref(),
@@ -2688,7 +2689,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
             elapsed_since(total_started),
             nq,
             scanned_nprobe,
-            reader.pq.nbits,
+            reader.pq.nbits(),
             k,
             unique_lists.len(),
             filter.is_some(),
@@ -2708,7 +2709,7 @@ fn search_batch_reader_filter_with_reuse_mode_and_observer<R: SeekRead>(
              budget_bytes={reuse_max_bytes} tables_built={tables_built}",
             tables_built > 0,
             metric.as_str(),
-            reader.pq.nbits,
+            reader.pq.nbits(),
             unique_lists.len(),
             filter.is_some(),
             reuse_required_bytes,
@@ -3311,7 +3312,7 @@ mod tests {
         let ids: Vec<i64> = (0..n as i64).collect();
 
         let mut index = IVFPQIndex::with_nbits(d, nlist, m, 4, MetricType::L2, false);
-        assert_eq!(index.pq.ksub, 16);
+        assert_eq!(index.pq.ksub(), 16);
         assert_eq!(index.pq.code_size(), 4);
 
         index.train(&data, n);
@@ -3875,7 +3876,7 @@ mod tests {
                 &pq_norms,
                 &mut actual,
             );
-            let table_size = m * index.pq.ksub;
+            let table_size = m * index.pq.ksub();
             assert_eq!(
                 actual,
                 index.precomputed_table[list_id * table_size..(list_id + 1) * table_size]

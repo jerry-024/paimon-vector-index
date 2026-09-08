@@ -346,8 +346,8 @@ impl VamanaGraph {
         params: DiskAnnBuildParams,
     ) -> io::Result<(Self, VamanaBuildStats)> {
         validate_build_inputs(vectors, count, dimension, params)?;
-        if pq.d != dimension
-            || !matches!(pq.nbits, 4 | 8)
+        if pq.d() != dimension
+            || !matches!(pq.nbits(), 4 | 8)
             || !pq.has_valid_layout()
             || pq_codes.len() != count.saturating_mul(pq.code_size())
         {
@@ -427,8 +427,8 @@ impl VamanaGraph {
             ));
         }
         if let Some((pq, pq_codes)) = pq_build {
-            if pq.d != dimension
-                || !matches!(pq.nbits, 4 | 8)
+            if pq.d() != dimension
+                || !matches!(pq.nbits(), 4 | 8)
                 || !pq.has_valid_layout()
                 || pq_codes.len() != count.saturating_mul(pq.code_size())
             {
@@ -1274,30 +1274,30 @@ impl<'a> PqBuildDistance<'a> {
         metric: MetricType,
     ) -> io::Result<Self> {
         let table_len = pq
-            .m
-            .checked_mul(pq.ksub)
-            .and_then(|value| value.checked_mul(pq.ksub))
+            .m()
+            .checked_mul(pq.ksub())
+            .and_then(|value| value.checked_mul(pq.ksub()))
             .ok_or_else(|| invalid_input("Vamana PQ build-distance table size overflows usize"))?;
         let mut centroid_distances = Vec::new();
         centroid_distances
             .try_reserve_exact(table_len)
             .map_err(|_| invalid_input("Vamana PQ build-distance table allocation failed"))?;
         centroid_distances.resize(table_len, 0.0);
-        for sub in 0..pq.m {
+        for sub in 0..pq.m() {
             let chunk_dim = pq.chunk_dim(sub);
             let sub_base = pq.centroid_chunk_base(sub);
-            let table_base = sub * pq.ksub * pq.ksub;
-            for left in 0..pq.ksub {
+            let table_base = sub * pq.ksub() * pq.ksub();
+            for left in 0..pq.ksub() {
                 let left_start = sub_base + left * chunk_dim;
-                for right in left..pq.ksub {
+                for right in left..pq.ksub() {
                     let right_start = sub_base + right * chunk_dim;
                     let distance = fvec_distance(
                         &pq.centroids()[left_start..left_start + chunk_dim],
                         &pq.centroids()[right_start..right_start + chunk_dim],
                         metric,
                     );
-                    centroid_distances[table_base + left * pq.ksub + right] = distance;
-                    centroid_distances[table_base + right * pq.ksub + left] = distance;
+                    centroid_distances[table_base + left * pq.ksub() + right] = distance;
+                    centroid_distances[table_base + right * pq.ksub() + left] = distance;
                 }
             }
         }
@@ -1310,9 +1310,9 @@ impl<'a> PqBuildDistance<'a> {
         Ok(Self {
             codes,
             code_size,
-            m: pq.m,
-            ksub: pq.ksub,
-            nbits: pq.nbits,
+            m: pq.m(),
+            ksub: pq.ksub(),
+            nbits: pq.nbits(),
             centroid_distances,
         })
     }
@@ -2499,14 +2499,14 @@ mod tests {
     fn vamana_pq_build_distance_matches_decoded_centroid_distance_for_4bit_codes() {
         let mut pq = ProductQuantizer::with_nbits(4, 2, 4);
         pq.set_centroids(
-            (0..pq.d * pq.ksub)
+            (0..pq.d() * pq.ksub())
                 .map(|index| index as f32 * 0.125)
                 .collect(),
         );
         let codes = [0x21, 0x43];
         let distance = PqBuildDistance::new(&pq, &codes, 2, MetricType::L2).unwrap();
-        let mut left = vec![0.0; pq.d];
-        let mut right = vec![0.0; pq.d];
+        let mut left = vec![0.0; pq.d()];
+        let mut right = vec![0.0; pq.d()];
         pq.decode(&codes[..1], &mut left);
         pq.decode(&codes[1..], &mut right);
 
@@ -2519,14 +2519,14 @@ mod tests {
     fn vamana_pq_build_distance_and_pruning_follow_inner_product_semantics() {
         let mut pq = ProductQuantizer::with_nbits(2, 1, 4);
         pq.set_centroids(
-            (0..pq.d * pq.ksub)
+            (0..pq.d() * pq.ksub())
                 .map(|index| index as f32 * 0.25 - 1.0)
                 .collect(),
         );
         let codes = [0x01, 0x03];
         let distance = PqBuildDistance::new(&pq, &codes, 2, MetricType::InnerProduct).unwrap();
-        let mut left = vec![0.0; pq.d];
-        let mut right = vec![0.0; pq.d];
+        let mut left = vec![0.0; pq.d()];
+        let mut right = vec![0.0; pq.d()];
         pq.decode(&codes[..1], &mut left);
         pq.decode(&codes[1..], &mut right);
 

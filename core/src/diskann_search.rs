@@ -1460,7 +1460,7 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
         let query_count = queries.len() / dimension;
         let pq_m = self.header.pq_m as usize;
         let pq = self.pq()?;
-        let pq_ksub = pq.ksub;
+        let pq_ksub = pq.ksub();
         let pq_code_size = pq.code_size();
         let pq_codes = self.pq_codes()?;
         let metric = self.header.metric_type();
@@ -1881,7 +1881,7 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
             self.header.max_degree as usize,
         )?;
         let pq = self.pq()?;
-        let distance_table_len = pq.m * pq.ksub;
+        let distance_table_len = pq.m() * pq.ksub();
         pq.compute_distance_table(
             query,
             self.header.metric_type(),
@@ -2024,7 +2024,7 @@ impl<R: SeekRead> crate::diskann_io::DiskAnnIndexReader<R> {
         let result = (|| {
             scratch.begin_rerank();
             let pq = self.pq()?;
-            let distance_table_len = pq.m * pq.ksub;
+            let distance_table_len = pq.m() * pq.ksub();
             pq.compute_distance_table(
                 query,
                 self.header.metric_type(),
@@ -5432,7 +5432,7 @@ mod tests {
 
         reader.ensure_resident().unwrap();
         assert_eq!(reader.header.pq_bits, 4);
-        assert_eq!(reader.pq().unwrap().ksub, 16);
+        assert_eq!(reader.pq().unwrap().ksub(), 16);
         assert_eq!(reader.pq_codes().unwrap().len(), indexed_count);
 
         let (result_ids, distances) = reader.search(query, 5, 100).unwrap();

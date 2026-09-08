@@ -1561,7 +1561,7 @@ impl<R: SeekRead> VectorIndexReader<R> {
                 metric: reader.metric,
                 total_vectors: reader.total_vectors,
                 pq_m: Some(reader.m),
-                pq_bits: Some(reader.pq.nbits),
+                pq_bits: Some(reader.pq.nbits()),
                 rq_bits: None,
                 diskann: None,
             },

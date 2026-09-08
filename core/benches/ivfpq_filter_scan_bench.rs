@@ -105,7 +105,7 @@ fn main() {
             .collect(),
     );
     index.pq.set_centroids(
-        (0..M * index.pq.ksub * index.pq.dsub)
+        (0..M * index.pq.ksub() * index.pq.dsub())
             .map(|_| rng.gen_range(-1.0f32..1.0))
             .collect(),
     );

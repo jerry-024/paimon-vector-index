@@ -280,9 +280,9 @@ fn checked_list_bytes(count: usize, bytes_per_entry: usize) -> io::Result<usize>
 pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()> {
     let d = index.d;
     let nlist = index.nlist;
-    let m = index.pq.m;
-    let ksub = index.pq.ksub;
-    let dsub = index.pq.dsub;
+    let m = index.pq.m();
+    let ksub = index.pq.ksub();
+    let dsub = index.pq.dsub();
     let code_size = index.pq.code_size();
     if ksub == 16 && !m.is_multiple_of(2) {
         return Err(io::Error::new(
@@ -1207,9 +1207,9 @@ fn compute_precomputed_table(
     nlist: usize,
     d: usize,
 ) -> Vec<f32> {
-    let m = pq.m;
-    let ksub = pq.ksub;
-    let dsub = pq.dsub;
+    let m = pq.m();
+    let ksub = pq.ksub();
+    let dsub = pq.dsub();
     let table_size = nlist * m * ksub;
     let mut table = vec![0.0f32; table_size];
 
@@ -1528,7 +1528,7 @@ mod tests {
 
         let mut cursor = Cursor::new(&buf);
         let mut reader = IVFPQIndexReader::open(&mut cursor).unwrap();
-        assert_eq!(reader.pq.nbits, 4);
+        assert_eq!(reader.pq.nbits(), 4);
         assert_eq!(reader.pq.code_size(), m / 2);
 
         let (result_ids, result_dists) = reader.search(&data[0..d], 5, 4).unwrap();

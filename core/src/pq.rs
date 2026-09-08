@@ -34,15 +34,22 @@ use std::sync::OnceLock;
 /// `chunk_offsets[m] * ksub`, and each of its `ksub` centroids contains
 /// `chunk_offsets[m + 1] - chunk_offsets[m]` contiguous components. Use
 /// [`Self::set_centroids`] to replace them so derived caches stay synchronized.
+/// Layout is immutable after construction so derived caches stay valid.
+///
+/// ```compile_fail,E0616
+/// use paimon_vindex_core::pq::ProductQuantizer;
+/// let mut pq = ProductQuantizer::new(12, 2);
+/// pq.chunk_offsets = vec![0, 4, 12];
+/// ```
 pub struct ProductQuantizer {
-    pub d: usize,
-    pub m: usize,
-    pub nbits: usize,
+    d: usize,
+    m: usize,
+    nbits: usize,
     /// Uniform chunk width for legacy formats, or the largest chunk width for
     /// a balanced non-uniform layout.
-    pub dsub: usize,
-    pub ksub: usize,
-    pub chunk_offsets: Vec<usize>,
+    dsub: usize,
+    ksub: usize,
+    chunk_offsets: Vec<usize>,
     centroids: Vec<f32>,
     /// Pre-computed squared norms of each centroid: [M * ksub].
     /// Avoids recomputing per query for L2 distance table.
@@ -51,6 +58,36 @@ pub struct ProductQuantizer {
 }
 
 impl ProductQuantizer {
+    /// Vector dimension.
+    pub fn d(&self) -> usize {
+        self.d
+    }
+
+    /// Number of subquantizers.
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    /// Bits per PQ code.
+    pub fn nbits(&self) -> usize {
+        self.nbits
+    }
+
+    /// Largest subvector dimension.
+    pub fn dsub(&self) -> usize {
+        self.dsub
+    }
+
+    /// Centroids per subquantizer.
+    pub fn ksub(&self) -> usize {
+        self.ksub
+    }
+
+    /// Contiguous subvector boundaries.
+    pub fn chunk_offsets(&self) -> &[usize] {
+        &self.chunk_offsets
+    }
+
     pub fn new(d: usize, m: usize) -> Self {
         Self::with_nbits(d, m, 8)
     }
