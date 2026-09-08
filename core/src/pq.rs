@@ -51,6 +51,7 @@ pub struct ProductQuantizer {
     ksub: usize,
     chunk_offsets: Vec<usize>,
     centroids: Vec<f32>,
+    centroids_are_finite: bool,
     /// Pre-computed squared norms of each centroid: [M * ksub].
     /// Avoids recomputing per query for L2 distance table.
     centroid_norms_cache: Vec<f32>,
@@ -165,6 +166,7 @@ impl ProductQuantizer {
             ksub,
             chunk_offsets,
             centroids: Vec::new(),
+            centroids_are_finite: true,
             centroid_norms_cache: Vec::new(),
             transposed_codebook_cache: OnceLock::new(),
         }
@@ -217,6 +219,7 @@ impl ProductQuantizer {
             "PQ centroids must hold d * ksub values"
         );
         let norms = self.try_compute_centroid_norms(&centroids)?;
+        self.centroids_are_finite = centroids.iter().all(|value| value.is_finite());
         self.centroids = centroids;
         self.centroid_norms_cache = norms;
         self.transposed_codebook_cache.take();
@@ -233,6 +236,7 @@ impl ProductQuantizer {
             ksub: self.ksub,
             chunk_offsets: self.chunk_offsets.clone(),
             centroids: self.centroids.clone(),
+            centroids_are_finite: self.centroids_are_finite,
             centroid_norms_cache: self.centroid_norms_cache.clone(),
             transposed_codebook_cache: OnceLock::new(),
         }
@@ -474,7 +478,7 @@ impl ProductQuantizer {
         if self.nbits == 8 && self.ksub == 256 && (0..self.m).all(|sub| self.chunk_dim(sub) >= 4) {
             if supports_transposed_pq_encoding() {
                 self.encode_batch_8bit_transposed(data, n, codes);
-            } else if self.centroids.iter().all(|value| value.is_finite()) {
+            } else if self.centroids_are_finite {
                 self.encode_batch_8bit_sgemm(data, n, codes);
             } else {
                 self.encode_batch(data, n, codes);
@@ -495,7 +499,7 @@ impl ProductQuantizer {
         debug_assert_eq!(cs, m);
         debug_assert_eq!(ksub, 256);
         debug_assert!((0..m).all(|sub| self.chunk_dim(sub) >= 4));
-        debug_assert!(self.centroids.iter().all(|value| value.is_finite()));
+        debug_assert!(self.centroids_are_finite);
 
         let max_dsub = (0..m).map(|sub| self.chunk_dim(sub)).max().unwrap_or(0);
         let computed_norms = self
@@ -1271,6 +1275,33 @@ mod tests {
                 let mut batch = vec![0u8; n * pq.code_size()];
                 pq.encode_batch_8bit_transposed(&data, n, &mut batch);
                 assert_eq!(batch, oracle, "d={d} m={m} n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_centroids_finite_cache_updates_and_clones() {
+        let mut pq = ProductQuantizer::new(4, 1);
+        for value in [0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.0] {
+            let mut centroids = vec![0.0; 4 * 256];
+            centroids[4 * 256 - 1] = value;
+            pq.set_centroids(centroids);
+            assert_eq!(pq.centroids_are_finite, value.is_finite());
+            let cloned = pq.clone_without_transposed_cache();
+            assert_eq!(cloned.centroids_are_finite, value.is_finite());
+            if !supports_transposed_pq_encoding() {
+                let data = [1.0; 4];
+                let mut expected = [0];
+                if value.is_finite() {
+                    pq.encode_batch_8bit_sgemm(&data, 1, &mut expected);
+                } else {
+                    pq.encode_batch(&data, 1, &mut expected);
+                }
+                for encoder in [&pq, &cloned] {
+                    let mut actual = [0];
+                    encoder.encode_batch_blocked(&data, 1, &mut actual);
+                    assert_eq!(actual, expected);
+                }
             }
         }
     }
