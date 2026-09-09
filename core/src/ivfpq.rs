@@ -209,6 +209,16 @@ impl IVFPQIndex {
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
+        self.train_with_config(data, n, &KMeansConfig::default(), &KMeansConfig::default());
+    }
+
+    pub fn train_with_config(
+        &mut self,
+        data: &[f32],
+        n: usize,
+        ivf_config: &KMeansConfig,
+        pq_config: &KMeansConfig,
+    ) {
         let d = self.d;
 
         let train_data = if self.metric == MetricType::Cosine {
@@ -225,7 +235,7 @@ impl IVFPQIndex {
         // IVF centroids must be trained on projected (rotated) data since
         // add() and search() assign rotated vectors via preprocess_queries().
         let effective_data = if let Some(ref mut opq) = self.opq {
-            opq.train(&train_data, n, &mut self.pq);
+            opq.train_with_config(&train_data, n, &mut self.pq, pq_config);
             let mut projected = vec![0.0f32; n * d];
             opq.apply_batch(&train_data, &mut projected, n);
             projected
@@ -233,9 +243,8 @@ impl IVFPQIndex {
             train_data
         };
 
-        let km_config = KMeansConfig::default();
         self.quantizer_centroids =
-            kmeans::kmeans_train(&km_config, &effective_data, n, d, self.nlist);
+            kmeans::kmeans_train(ivf_config, &effective_data, n, d, self.nlist);
         self.coarse_assignment.reset();
 
         // Retrain PQ on the same assignment distribution that add/search will encode.
@@ -259,7 +268,7 @@ impl IVFPQIndex {
         } else {
             effective_data
         };
-        self.pq.train(&pq_train_data, n);
+        self.pq.train_with_config(&pq_train_data, n, pq_config);
     }
 
     /// Add vectors in batches (Faiss-style: batch assign → batch residual → batch encode).

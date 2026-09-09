@@ -282,6 +282,15 @@ impl DiskAnnIndex {
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) -> io::Result<()> {
+        self.train_with_config(data, n, &KMeansConfig::default())
+    }
+
+    pub fn train_with_config(
+        &mut self,
+        data: &[f32],
+        n: usize,
+        config: &KMeansConfig,
+    ) -> io::Result<()> {
         if n == 0 {
             return Err(invalid_input(
                 "DiskANN training vector count must be greater than zero",
@@ -307,7 +316,7 @@ impl DiskAnnIndex {
         self.pq.train_hot_start_with_parallelism(
             &processed,
             plan.sample_count,
-            &KMeansConfig::default(),
+            config,
             false,
             plan.parallelism,
         );

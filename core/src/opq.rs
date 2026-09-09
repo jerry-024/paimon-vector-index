@@ -57,6 +57,16 @@ impl OPQMatrix {
     /// Train the OPQ rotation matrix.
     /// data: flat [n * d].
     pub fn train(&mut self, data: &[f32], n: usize, pq: &mut ProductQuantizer) {
+        self.train_with_config(data, n, pq, &KMeansConfig::default());
+    }
+
+    pub fn train_with_config(
+        &mut self,
+        data: &[f32],
+        n: usize,
+        pq: &mut ProductQuantizer,
+        config: &KMeansConfig,
+    ) {
         let d = self.d;
         let mut rng = StdRng::seed_from_u64(12345);
 
@@ -122,7 +132,7 @@ impl OPQMatrix {
             };
             let km_config = KMeansConfig {
                 niter: pq_niter,
-                ..KMeansConfig::default()
+                ..*config
             };
             let hot_start = iter > 0;
             pq.train_hot_start(&projected, train_n, &km_config, hot_start);
@@ -156,7 +166,7 @@ impl OPQMatrix {
 
         // Final PQ training with the learned rotation
         self.apply_batch(&train_data, &mut projected, train_n);
-        pq.train_with_config(&projected, train_n, &KMeansConfig::default());
+        pq.train_with_config(&projected, train_n, config);
 
         self.is_trained = true;
     }
@@ -195,6 +205,39 @@ impl OPQMatrix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn training_max_points_per_centroid_applies_to_opq_iterations_and_final_pq() {
+        let d = 4;
+        let n = 64;
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut data = Vec::new();
+        for _ in 0..n / 2 {
+            let vector = (0..d).map(|_| rng.gen::<f32>()).collect::<Vec<_>>();
+            data.extend_from_slice(&vector);
+            data.extend(vector.iter().map(|value| -value));
+        }
+        let config = KMeansConfig {
+            max_points_per_centroid: 1,
+            ..KMeansConfig::default()
+        };
+        let mut opq = OPQMatrix::new(d, 2);
+        opq.niter = 2;
+        let mut pq = ProductQuantizer::with_nbits(d, 2, 4);
+        opq.train_with_config(&data, n, &mut pq, &config);
+
+        // Paired vectors have zero mean, so OPQ centering leaves this data unchanged.
+        let mut projected = vec![0.0; n * d];
+        opq.apply_batch(&data, &mut projected, n);
+        let mut expected = ProductQuantizer::with_nbits(d, 2, 4);
+        expected.train_with_config(&projected, n, &config);
+        assert_eq!(pq.centroids(), expected.centroids());
+
+        let mut default_opq = OPQMatrix::new(d, 2);
+        default_opq.niter = 2;
+        default_opq.train(&data, n, &mut expected);
+        assert_ne!(opq.rotation, default_opq.rotation);
+    }
 
     #[test]
     fn test_rotation_orthogonality() {

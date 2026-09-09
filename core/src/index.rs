@@ -50,6 +50,7 @@ use crate::ivfsq_io::{
     search_batch_ivfsq_reader_filter_range, search_batch_ivfsq_reader_roaring_filter_range,
     write_ivfsq_index, IVFSQIndexReader, IVF_SQ_MAGIC,
 };
+use crate::kmeans::KMeansConfig;
 pub use crate::read_options::{DeploymentProfile, VectorIndexReadPlan, VectorIndexReaderOptions};
 use crate::rq::{is_supported_rq_bits, padded_dimension, DEFAULT_RQ_BITS};
 use rand::rngs::StdRng;
@@ -147,6 +148,7 @@ pub enum VectorIndexConfig {
         nlist: usize,
         metric: MetricType,
         use_approximate_coarse_assignment: bool,
+        ivf_train_max_points_per_centroid: usize,
     },
     IvfPq {
         dimension: usize,
@@ -158,6 +160,8 @@ pub enum VectorIndexConfig {
         /// Use canonical expanded-form PQ encoding instead of the default
         /// transposed direct-L2 encoder.
         canonical_pq_encoding: bool,
+        ivf_train_max_points_per_centroid: usize,
+        pq_train_max_points_per_centroid: usize,
     },
     IvfRq {
         dimension: usize,
@@ -165,12 +169,14 @@ pub enum VectorIndexConfig {
         bits: usize,
         metric: MetricType,
         use_approximate_coarse_assignment: bool,
+        ivf_train_max_points_per_centroid: usize,
     },
     IvfSq {
         dimension: usize,
         nlist: usize,
         metric: MetricType,
         use_approximate_coarse_assignment: bool,
+        ivf_train_max_points_per_centroid: usize,
     },
     DiskAnn {
         dimension: usize,
@@ -178,6 +184,7 @@ pub enum VectorIndexConfig {
         pq_m: usize,
         pq_bits: usize,
         build: DiskAnnBuildParams,
+        pq_train_max_points_per_centroid: usize,
     },
 }
 
@@ -211,6 +218,8 @@ impl VectorIndexConfig {
             use_opq,
             use_approximate_coarse_assignment: true,
             canonical_pq_encoding: false,
+            ivf_train_max_points_per_centroid: 256,
+            pq_train_max_points_per_centroid: 256,
         };
         validate_config(&config)?;
         Ok(config)
@@ -228,6 +237,7 @@ impl VectorIndexConfig {
             pq_m: infer_pq_m(dimension, pq_bits, DEFAULT_PQ_CODE_RATIO)?,
             pq_bits,
             build,
+            pq_train_max_points_per_centroid: 256,
         };
         validate_config(&config)?;
         Ok(config)
@@ -240,6 +250,7 @@ impl VectorIndexConfig {
             bits: DEFAULT_RQ_BITS,
             metric,
             use_approximate_coarse_assignment: true,
+            ivf_train_max_points_per_centroid: 256,
         };
         validate_config(&config)?;
         Ok(config)
@@ -290,6 +301,8 @@ pub struct ResolvedVectorIndexConfig {
     /// Only meaningful for IVF-PQ.
     pub canonical_pq_encoding: bool,
     pub diskann_build: Option<DiskAnnBuildParams>,
+    pub ivf_train_max_points_per_centroid: Option<usize>,
+    pub pq_train_max_points_per_centroid: Option<usize>,
 }
 
 impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
@@ -300,12 +313,14 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 nlist,
                 metric,
                 use_approximate_coarse_assignment,
+                ivf_train_max_points_per_centroid,
             }
             | VectorIndexConfig::IvfSq {
                 dimension,
                 nlist,
                 metric,
                 use_approximate_coarse_assignment,
+                ivf_train_max_points_per_centroid,
             } => Self {
                 index_type: config.index_type(),
                 dimension: *dimension,
@@ -318,6 +333,8 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 use_approximate_coarse_assignment: *use_approximate_coarse_assignment,
                 canonical_pq_encoding: false,
                 diskann_build: None,
+                ivf_train_max_points_per_centroid: Some(*ivf_train_max_points_per_centroid),
+                pq_train_max_points_per_centroid: None,
             },
             VectorIndexConfig::IvfPq {
                 dimension,
@@ -327,6 +344,8 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 use_opq,
                 use_approximate_coarse_assignment,
                 canonical_pq_encoding,
+                ivf_train_max_points_per_centroid,
+                pq_train_max_points_per_centroid,
             } => Self {
                 index_type: IndexType::IvfPq,
                 dimension: *dimension,
@@ -339,6 +358,8 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 use_approximate_coarse_assignment: *use_approximate_coarse_assignment,
                 canonical_pq_encoding: *canonical_pq_encoding,
                 diskann_build: None,
+                ivf_train_max_points_per_centroid: Some(*ivf_train_max_points_per_centroid),
+                pq_train_max_points_per_centroid: Some(*pq_train_max_points_per_centroid),
             },
             VectorIndexConfig::IvfRq {
                 dimension,
@@ -346,6 +367,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 bits,
                 metric,
                 use_approximate_coarse_assignment,
+                ivf_train_max_points_per_centroid,
             } => Self {
                 index_type: IndexType::IvfRq,
                 dimension: *dimension,
@@ -358,6 +380,8 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 use_approximate_coarse_assignment: *use_approximate_coarse_assignment,
                 canonical_pq_encoding: false,
                 diskann_build: None,
+                ivf_train_max_points_per_centroid: Some(*ivf_train_max_points_per_centroid),
+                pq_train_max_points_per_centroid: None,
             },
             VectorIndexConfig::DiskAnn {
                 dimension,
@@ -365,6 +389,7 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 pq_m,
                 pq_bits,
                 build,
+                pq_train_max_points_per_centroid,
             } => Self {
                 index_type: IndexType::DiskAnn,
                 dimension: *dimension,
@@ -377,6 +402,8 @@ impl From<&VectorIndexConfig> for ResolvedVectorIndexConfig {
                 use_approximate_coarse_assignment: false,
                 canonical_pq_encoding: false,
                 diskann_build: Some(*build),
+                ivf_train_max_points_per_centroid: None,
+                pq_train_max_points_per_centroid: Some(*pq_train_max_points_per_centroid),
             },
         }
     }
@@ -450,6 +477,10 @@ impl VectorIndexBuildPlan {
                 nlist: parse_nlist_options(&mut options, expected_vector_count)?,
                 metric,
                 use_approximate_coarse_assignment,
+                ivf_train_max_points_per_centroid: parse_training_max_points_per_centroid(
+                    &mut options,
+                    "ivf.train.max-points-per-centroid",
+                )?,
             },
             IndexType::IvfPq => VectorIndexConfig::IvfPq {
                 dimension,
@@ -473,6 +504,14 @@ impl VectorIndexBuildPlan {
                 },
                 use_approximate_coarse_assignment,
                 canonical_pq_encoding,
+                ivf_train_max_points_per_centroid: parse_training_max_points_per_centroid(
+                    &mut options,
+                    "ivf.train.max-points-per-centroid",
+                )?,
+                pq_train_max_points_per_centroid: parse_training_max_points_per_centroid(
+                    &mut options,
+                    "pq.train.max-points-per-centroid",
+                )?,
             },
             IndexType::IvfRq => {
                 let explicit_bits = options
@@ -494,6 +533,10 @@ impl VectorIndexBuildPlan {
                     bits,
                     metric,
                     use_approximate_coarse_assignment,
+                    ivf_train_max_points_per_centroid: parse_training_max_points_per_centroid(
+                        &mut options,
+                        "ivf.train.max-points-per-centroid",
+                    )?,
                 }
             }
             IndexType::IvfSq => VectorIndexConfig::IvfSq {
@@ -501,6 +544,10 @@ impl VectorIndexBuildPlan {
                 nlist: parse_nlist_options(&mut options, expected_vector_count)?,
                 metric,
                 use_approximate_coarse_assignment,
+                ivf_train_max_points_per_centroid: parse_training_max_points_per_centroid(
+                    &mut options,
+                    "ivf.train.max-points-per-centroid",
+                )?,
             },
             IndexType::DiskAnn => {
                 let pq_bits = match options.optional("pq.bits") {
@@ -547,6 +594,10 @@ impl VectorIndexBuildPlan {
                     )?,
                     pq_bits,
                     build,
+                    pq_train_max_points_per_centroid: parse_training_max_points_per_centroid(
+                        &mut options,
+                        "pq.train.max-points-per-centroid",
+                    )?,
                 }
             }
         };
@@ -618,6 +669,17 @@ impl ConfigOptions {
             )))
         }
     }
+}
+
+fn parse_training_max_points_per_centroid(
+    options: &mut ConfigOptions,
+    key: &str,
+) -> io::Result<usize> {
+    options
+        .optional(key)
+        .map(|value| parse_usize_option(key, &value))
+        .transpose()
+        .map(|value| value.unwrap_or(KMeansConfig::default().max_points_per_centroid))
 }
 
 fn parse_nlist_options(
@@ -1224,6 +1286,8 @@ pub struct DiskAnnMetadata {
 
 pub struct VectorIndexTrainer {
     writer: VectorIndexWriter,
+    ivf_training: KMeansConfig,
+    pq_training: KMeansConfig,
     training_data: Vec<f32>,
     training_vector_count: usize,
     training_vectors_seen: usize,
@@ -1233,6 +1297,15 @@ pub struct VectorIndexTrainer {
 
 impl VectorIndexTrainer {
     pub fn new(config: VectorIndexConfig) -> io::Result<Self> {
+        let resolved = config.resolved();
+        let mut ivf_training = KMeansConfig::default();
+        let mut pq_training = KMeansConfig::default();
+        if let Some(max_points) = resolved.ivf_train_max_points_per_centroid {
+            ivf_training.max_points_per_centroid = max_points;
+        }
+        if let Some(max_points) = resolved.pq_train_max_points_per_centroid {
+            pq_training.max_points_per_centroid = max_points;
+        }
         let training_sample_limit = match &config {
             VectorIndexConfig::DiskAnn {
                 dimension,
@@ -1240,6 +1313,7 @@ impl VectorIndexTrainer {
                 pq_m,
                 pq_bits,
                 build,
+                ..
             } => diskann_training_sample_limit(
                 *dimension,
                 *metric,
@@ -1256,6 +1330,8 @@ impl VectorIndexTrainer {
         let writer = VectorIndexWriter::from_config(config)?;
         Ok(Self {
             writer,
+            ivf_training,
+            pq_training,
             training_data: Vec::new(),
             training_vector_count: 0,
             training_vectors_seen: 0,
@@ -1311,8 +1387,12 @@ impl VectorIndexTrainer {
         if self.training_vector_count == 0 || self.training_data.is_empty() {
             return Err(invalid_input("no training vectors added"));
         }
-        self.writer
-            .train_internal(&self.training_data, self.training_vector_count)?;
+        self.writer.train_internal(
+            &self.training_data,
+            self.training_vector_count,
+            &self.ivf_training,
+            &self.pq_training,
+        )?;
         Ok(VectorIndexTraining { inner: self.writer })
     }
 }
@@ -1352,6 +1432,7 @@ impl VectorIndexWriter {
                 nlist,
                 metric,
                 use_approximate_coarse_assignment,
+                ..
             } => {
                 let mut index = IVFFlatIndex::new(dimension, nlist, metric);
                 index.set_approximate_coarse_assignment(use_approximate_coarse_assignment);
@@ -1362,6 +1443,7 @@ impl VectorIndexWriter {
                 nlist,
                 metric,
                 use_approximate_coarse_assignment,
+                ..
             } => {
                 let mut index = IVFSQIndex::new(dimension, nlist, metric);
                 index.set_approximate_coarse_assignment(use_approximate_coarse_assignment);
@@ -1375,6 +1457,7 @@ impl VectorIndexWriter {
                 use_opq,
                 use_approximate_coarse_assignment,
                 canonical_pq_encoding,
+                ..
             } => {
                 let mut index = IVFPQIndex::new(dimension, nlist, m, metric, use_opq);
                 index.set_approximate_coarse_assignment(use_approximate_coarse_assignment);
@@ -1387,6 +1470,7 @@ impl VectorIndexWriter {
                 bits,
                 metric,
                 use_approximate_coarse_assignment,
+                ..
             } => {
                 let mut index = IVFRQIndex::with_bits(dimension, nlist, bits, metric);
                 index.set_approximate_coarse_assignment(use_approximate_coarse_assignment);
@@ -1398,6 +1482,7 @@ impl VectorIndexWriter {
                 pq_m,
                 pq_bits,
                 build,
+                ..
             } => Self::DiskAnn(DiskAnnIndex::with_pq_bits(
                 dimension, metric, pq_m, pq_bits, build,
             )),
@@ -1424,14 +1509,20 @@ impl VectorIndexWriter {
         }
     }
 
-    fn train_internal(&mut self, data: &[f32], n: usize) -> io::Result<()> {
+    fn train_internal(
+        &mut self,
+        data: &[f32],
+        n: usize,
+        ivf_training: &KMeansConfig,
+        pq_training: &KMeansConfig,
+    ) -> io::Result<()> {
         debug_assert_eq!(Some(data.len()), n.checked_mul(self.dimension()));
         match self {
-            Self::IvfFlat(index) => index.train(data, n),
-            Self::IvfSq(index) => index.train(data, n),
-            Self::IvfPq(index) => index.train(data, n),
-            Self::IvfRq(index) => index.train(data, n),
-            Self::DiskAnn(index) => return index.train(data, n),
+            Self::IvfFlat(index) => index.train_with_config(data, n, ivf_training),
+            Self::IvfSq(index) => index.train_with_config(data, n, ivf_training),
+            Self::IvfPq(index) => index.train_with_config(data, n, ivf_training, pq_training),
+            Self::IvfRq(index) => index.train_with_config(data, n, ivf_training),
+            Self::DiskAnn(index) => return index.train_with_config(data, n, pq_training),
         }
         Ok(())
     }
@@ -2375,10 +2466,31 @@ fn validate_config(config: &VectorIndexConfig) -> io::Result<()> {
             pq_m,
             pq_bits,
             build,
+            ..
         } => {
             validate_diskann_config(*dimension, *metric, *pq_m, *pq_bits, *build)?;
         }
         _ => {}
+    }
+    let resolved = config.resolved();
+    for (key, max_points, centroids) in [
+        (
+            "ivf.train.max-points-per-centroid",
+            resolved.ivf_train_max_points_per_centroid,
+            config.nlist(),
+        ),
+        (
+            "pq.train.max-points-per-centroid",
+            resolved.pq_train_max_points_per_centroid,
+            1usize << resolved.pq_bits.unwrap_or(8),
+        ),
+    ] {
+        if let Some(max_points) = max_points {
+            validate_positive(max_points, key)?;
+            centroids.checked_mul(max_points).ok_or_else(|| {
+                invalid_input(format!("{key} times centroid count overflows usize"))
+            })?;
+        }
     }
     Ok(())
 }
@@ -2691,6 +2803,7 @@ mod tests {
                 nlist: 1,
                 metric: MetricType::L2,
                 use_approximate_coarse_assignment: true,
+                ivf_train_max_points_per_centroid: 256,
             },
             &[0.0, 1.0],
             2,
@@ -2720,6 +2833,7 @@ mod tests {
                 build_search_list_size: 16,
                 ..DiskAnnBuildParams::default()
             },
+            pq_train_max_points_per_centroid: 256,
         });
 
         reader
@@ -2744,6 +2858,7 @@ mod tests {
             metric: MetricType::L2,
             bits: 4,
             use_approximate_coarse_assignment: true,
+            ivf_train_max_points_per_centroid: 256,
         });
 
         reader
@@ -2768,6 +2883,7 @@ mod tests {
             metric: MetricType::L2,
             bits: 4,
             use_approximate_coarse_assignment: true,
+            ivf_train_max_points_per_centroid: 256,
         });
         let queries = [0, nlist - 1]
             .into_iter()
@@ -2813,6 +2929,7 @@ mod tests {
                     build_search_list_size: 16,
                     ..DiskAnnBuildParams::default()
                 },
+                pq_train_max_points_per_centroid: 256,
             },
             &data,
             count,
@@ -2922,6 +3039,7 @@ mod tests {
             nlist: 4,
             metric: MetricType::L2,
             use_approximate_coarse_assignment: true,
+            ivf_train_max_points_per_centroid: 256,
         });
         roundtrip(VectorIndexConfig::ivf_pq(16, 4, MetricType::L2, false).unwrap());
         roundtrip(VectorIndexConfig::IvfRq {
@@ -2930,12 +3048,14 @@ mod tests {
             bits: DEFAULT_RQ_BITS,
             metric: MetricType::L2,
             use_approximate_coarse_assignment: true,
+            ivf_train_max_points_per_centroid: 256,
         });
         roundtrip(VectorIndexConfig::IvfSq {
             dimension: 8,
             nlist: 4,
             metric: MetricType::L2,
             use_approximate_coarse_assignment: true,
+            ivf_train_max_points_per_centroid: 256,
         });
         roundtrip(
             VectorIndexConfig::disk_ann(
@@ -2975,6 +3095,7 @@ mod tests {
                 nlist: 4,
                 metric: MetricType::L2,
                 use_approximate_coarse_assignment: true,
+                ivf_train_max_points_per_centroid: 256,
             },
             VectorIndexConfig::IvfPq {
                 dimension: 16,
@@ -2984,6 +3105,8 @@ mod tests {
                 use_opq: false,
                 use_approximate_coarse_assignment: true,
                 canonical_pq_encoding: false,
+                ivf_train_max_points_per_centroid: 256,
+                pq_train_max_points_per_centroid: 256,
             },
             VectorIndexConfig::IvfRq {
                 dimension: 8,
@@ -2991,12 +3114,14 @@ mod tests {
                 bits: DEFAULT_RQ_BITS,
                 metric: MetricType::L2,
                 use_approximate_coarse_assignment: true,
+                ivf_train_max_points_per_centroid: 256,
             },
             VectorIndexConfig::IvfSq {
                 dimension: 8,
                 nlist: 4,
                 metric: MetricType::L2,
                 use_approximate_coarse_assignment: true,
+                ivf_train_max_points_per_centroid: 256,
             },
         ] {
             let d = config.dimension();
@@ -3085,6 +3210,8 @@ mod tests {
             use_opq: false,
             use_approximate_coarse_assignment: true,
             canonical_pq_encoding: false,
+            ivf_train_max_points_per_centroid: 256,
+            pq_train_max_points_per_centroid: 256,
         }) {
             Ok(_) => panic!("invalid PQ config should be rejected"),
             Err(err) => err,
@@ -3100,6 +3227,7 @@ mod tests {
             bits: DEFAULT_RQ_BITS,
             metric: MetricType::L2,
             use_approximate_coarse_assignment: true,
+            ivf_train_max_points_per_centroid: 256,
         })
         .unwrap();
         let err = match VectorIndexTrainer::new(VectorIndexConfig::IvfRq {
@@ -3108,6 +3236,7 @@ mod tests {
             bits: 9,
             metric: MetricType::L2,
             use_approximate_coarse_assignment: true,
+            ivf_train_max_points_per_centroid: 256,
         }) {
             Ok(_) => panic!("invalid RQ config should be rejected"),
             Err(err) => err,
@@ -3824,6 +3953,7 @@ mod tests {
                 build_distance: DiskAnnBuildDistance::ProductQuantized,
                 ..DiskAnnBuildParams::default()
             },
+            pq_train_max_points_per_centroid: 256,
         };
         let mut writer = build_writer(config, data, count);
         writer.add_vectors(ids, data, count).unwrap();
@@ -3929,6 +4059,7 @@ mod tests {
                         raw_vector_encoding: DiskAnnRawVectorEncoding::F32,
                         ..DiskAnnBuildParams::default()
                     },
+                    pq_train_max_points_per_centroid: 256,
                 },
                 &data,
                 count,
@@ -4053,6 +4184,7 @@ mod tests {
             pq_m: 2,
             pq_bits: 8,
             build: DiskAnnBuildParams::default(),
+            pq_train_max_points_per_centroid: 256,
         })
         .expect("DiskANN trainer should open");
 
@@ -4075,6 +4207,7 @@ mod tests {
                 seed: 73,
                 ..DiskAnnBuildParams::default()
             },
+            pq_train_max_points_per_centroid: 256,
         };
 
         let mut whole = VectorIndexTrainer::new(config()).unwrap();
@@ -4113,6 +4246,7 @@ mod tests {
                 memory_budget_bytes,
                 ..DiskAnnBuildParams::default()
             },
+            pq_train_max_points_per_centroid: 256,
         };
         let trainer = VectorIndexTrainer::new(config).unwrap();
         assert!(trainer.training_sample_limit < DISKANN_MAX_PQ_TRAINING_VECTORS);
@@ -4135,6 +4269,7 @@ mod tests {
                 pq_m: 2,
                 pq_bits: 8,
                 build: DiskAnnBuildParams::default(),
+                pq_train_max_points_per_centroid: 256,
             },
             &data,
             count,
@@ -4157,6 +4292,7 @@ mod tests {
                 pq_m: 2,
                 pq_bits: 8,
                 build: DiskAnnBuildParams::default(),
+                pq_train_max_points_per_centroid: 256,
             },
             &training_data,
             training_count,
@@ -4276,6 +4412,7 @@ mod tests {
                         nlist: 1,
                         metric: MetricType::L2,
                         use_approximate_coarse_assignment: true,
+                        ivf_train_max_points_per_centroid: 256,
                     },
                     &[value, 1.0],
                     2,
@@ -4397,6 +4534,105 @@ mod tests {
     }
 
     #[test]
+    fn training_max_points_per_centroid_defaults_and_validation() {
+        let base = options(&[
+            ("index.type", "ivf_pq"),
+            ("dimension", "4"),
+            ("nlist", "2"),
+            ("metric", "l2"),
+        ]);
+        let resolved = VectorIndexConfig::from_options(&base).unwrap().resolved();
+        assert_eq!(resolved.ivf_train_max_points_per_centroid, Some(256));
+        assert_eq!(resolved.pq_train_max_points_per_centroid, Some(256));
+
+        for key in [
+            "ivf.train.max-points-per-centroid",
+            "pq.train.max-points-per-centroid",
+        ] {
+            for value in ["0", "-1", "1.5", "abc", "", &usize::MAX.to_string()] {
+                let mut opts = base.clone();
+                opts.insert(key.into(), value.into());
+                let error = VectorIndexConfig::from_options(&opts).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert!(error.to_string().contains(key), "{error}");
+            }
+        }
+        for (index_type, key) in [
+            ("ivf_flat", "pq.train.max-points-per-centroid"),
+            ("ivf_sq", "pq.train.max-points-per-centroid"),
+            ("ivf_rq", "pq.train.max-points-per-centroid"),
+            ("diskann", "ivf.train.max-points-per-centroid"),
+            ("ivf_pq", "fields.vector.ivf.train.max-points-per-centroid"),
+            ("ivf_pq", "fields.vector.pq.train.max-points-per-centroid"),
+        ] {
+            let mut opts = base.clone();
+            opts.insert("index.type".into(), index_type.into());
+            if index_type == "diskann" {
+                opts.remove("nlist");
+            }
+            opts.insert(key.into(), "32".into());
+            let error = VectorIndexConfig::from_options(&opts).unwrap_err();
+            assert!(error.to_string().contains("unknown vector index option"));
+            assert!(error.to_string().contains(key));
+        }
+    }
+
+    #[test]
+    fn training_max_points_per_centroid_controls_ivf_and_pq() {
+        use crate::kmeans::{kmeans_train, KMeansConfig};
+        use crate::pq::ProductQuantizer;
+
+        let n = 600;
+        let d = 4;
+        let data = (0..n * d)
+            .map(|i| ((i * 37 % 997) as f32).sin())
+            .collect::<Vec<_>>();
+        let ivf_config = KMeansConfig {
+            max_points_per_centroid: 1,
+            ..KMeansConfig::default()
+        };
+        let pq_config = KMeansConfig {
+            max_points_per_centroid: 2,
+            ..KMeansConfig::default()
+        };
+        let expected_centroids = kmeans_train(&ivf_config, &data, n, d, 2);
+        let mut expected_pq = ProductQuantizer::new(d, 1);
+        expected_pq.train_with_config(&data, n, &pq_config);
+
+        for index_type in ["ivf_flat", "ivf_sq", "ivf_rq", "ivf_pq", "diskann"] {
+            let mut opts = options(&[
+                ("index.type", index_type),
+                ("dimension", "4"),
+                ("metric", "inner_product"),
+            ]);
+            if index_type != "diskann" {
+                opts.insert("nlist".into(), "2".into());
+                opts.insert("ivf.train.max-points-per-centroid".into(), "1".into());
+            }
+            if matches!(index_type, "ivf_pq" | "diskann") {
+                opts.insert("pq.m".into(), "1".into());
+                opts.insert("pq.train.max-points-per-centroid".into(), "2".into());
+            }
+            let config = VectorIndexConfig::from_options(&opts).unwrap();
+            let training = VectorIndexTrainer::train(config, &data, n).unwrap();
+            let centroids = match VectorIndexWriter::new(training) {
+                VectorIndexWriter::IvfFlat(index) => index.quantizer_centroids().to_vec(),
+                VectorIndexWriter::IvfSq(index) => index.quantizer_centroids().to_vec(),
+                VectorIndexWriter::IvfRq(index) => index.quantizer_centroids().to_vec(),
+                VectorIndexWriter::IvfPq(index) => {
+                    assert_eq!(index.pq.centroids(), expected_pq.centroids());
+                    index.quantizer_centroids().to_vec()
+                }
+                VectorIndexWriter::DiskAnn(index) => {
+                    assert_eq!(index.pq.centroids(), expected_pq.centroids());
+                    continue;
+                }
+            };
+            assert_eq!(centroids, expected_centroids, "{index_type}");
+        }
+    }
+
+    #[test]
     fn config_from_options_rejects_unknown_options() {
         let err = VectorIndexConfig::from_options(&options(&[
             ("index.type", "ivf_flat"),
@@ -4470,6 +4706,7 @@ mod tests {
                     nlist: 1,
                     metric: MetricType::L2,
                     use_approximate_coarse_assignment: true,
+                    ivf_train_max_points_per_centroid: 256,
                 },
                 &[0.0, 1.0],
                 2,

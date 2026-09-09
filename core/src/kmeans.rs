@@ -150,6 +150,7 @@ fn kmeans_train_hierarchical(
     let initial_config = KMeansConfig {
         niter: config.niter,
         seed: config.seed,
+        max_points_per_centroid: config.max_points_per_centroid,
         ..KMeansConfig::default()
     };
     let initial_centroids =
@@ -200,6 +201,7 @@ fn kmeans_train_hierarchical(
         let sub_config = KMeansConfig {
             niter: 10,
             seed: config.seed + finalized.len() as u64,
+            max_points_per_centroid: config.max_points_per_centroid,
             ..KMeansConfig::default()
         };
         let sub_centroids = kmeans_train_with_init(&sub_config, &sub_data, sub_n, d, split_k, None);

@@ -82,9 +82,12 @@ impl IVFSQIndex {
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
+        self.train_with_config(data, n, &KMeansConfig::default())
+    }
+
+    pub fn train_with_config(&mut self, data: &[f32], n: usize, config: &KMeansConfig) {
         let processed = self.preprocess_vectors(data, n);
-        self.quantizer_centroids =
-            kmeans::kmeans_train(&KMeansConfig::default(), &processed, n, self.d, self.nlist);
+        self.quantizer_centroids = kmeans::kmeans_train(config, &processed, n, self.d, self.nlist);
         self.coarse_assignment.reset();
         let list_ids = self.coarse_assignment.assign(
             &processed,

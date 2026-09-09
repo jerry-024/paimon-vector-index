@@ -645,6 +645,7 @@ fn index_specs(config: &Config) -> Vec<IndexSpec> {
                 nlist: config.nlist,
                 metric: MetricType::L2,
                 use_approximate_coarse_assignment: true,
+                ivf_train_max_points_per_centroid: 256,
             },
             searches: vec![ivf_search],
         },
@@ -655,6 +656,7 @@ fn index_specs(config: &Config) -> Vec<IndexSpec> {
                 nlist: config.nlist,
                 metric: MetricType::L2,
                 use_approximate_coarse_assignment: true,
+                ivf_train_max_points_per_centroid: 256,
             },
             searches: vec![ivf_search],
         },
@@ -668,6 +670,8 @@ fn index_specs(config: &Config) -> Vec<IndexSpec> {
                 use_opq: false,
                 use_approximate_coarse_assignment: true,
                 canonical_pq_encoding: false,
+                ivf_train_max_points_per_centroid: 256,
+                pq_train_max_points_per_centroid: 256,
             },
             searches: vec![ivf_search],
         },
@@ -679,6 +683,7 @@ fn index_specs(config: &Config) -> Vec<IndexSpec> {
                 bits: config.rq_bits,
                 metric: MetricType::L2,
                 use_approximate_coarse_assignment: true,
+                ivf_train_max_points_per_centroid: 256,
             },
             searches: vec![ivf_search],
         },
@@ -695,6 +700,7 @@ fn index_specs(config: &Config) -> Vec<IndexSpec> {
                     raw_vector_encoding: config.diskann_raw_vector_encoding,
                     ..DiskAnnBuildParams::default()
                 },
+                pq_train_max_points_per_centroid: 256,
             },
             searches: config
                 .diskann_l_searches

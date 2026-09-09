@@ -152,6 +152,10 @@ impl IVFRQIndex {
     }
 
     pub fn train(&mut self, data: &[f32], n: usize) {
+        self.train_with_config(data, n, &KMeansConfig::default())
+    }
+
+    pub fn train_with_config(&mut self, data: &[f32], n: usize, config: &KMeansConfig) {
         let timing = build_timing_enabled();
         let total_started = Instant::now();
         let phase_started = Instant::now();
@@ -159,8 +163,7 @@ impl IVFRQIndex {
         log_build_timing(timing, "train.preprocess", phase_started);
 
         let phase_started = Instant::now();
-        self.quantizer_centroids =
-            kmeans::kmeans_train(&KMeansConfig::default(), &processed, n, self.d, self.nlist);
+        self.quantizer_centroids = kmeans::kmeans_train(config, &processed, n, self.d, self.nlist);
         log_build_timing(timing, "train.kmeans", phase_started);
 
         let phase_started = Instant::now();
